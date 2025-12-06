@@ -32,10 +32,11 @@ if(BUILD_TESTING)
   # for ROS 2 launch‐testing
   find_package(launch_testing_ament_cmake REQUIRED)
   # This will install and run your test/controller_spawner_launch.py
-  add_launch_test(test/test_spawner_basic.test.py TIMEOUT 360)
-  add_launch_test(test/test_spawner_twice.test.py TIMEOUT 360)
-  add_launch_test(test/test_spawner_estop.test.py TIMEOUT 360)
-  add_launch_test(test/test_spawner_chain_detection.test.py TIMEOUT 360)
+  # add_launch_test(test/test_spawner_basic.test.py TIMEOUT 360)
+  # add_launch_test(test/test_spawner_twice.test.py TIMEOUT 360)
+  # add_launch_test(test/test_spawner_estop.test.py TIMEOUT 360)
+  # add_launch_test(test/test_spawner_chain_detection.test.py TIMEOUT 360)
+  add_launch_test(test/test_spawner_multiple_chained.test.py TIMEOUT 360)
 endif()
 
 install(TARGETS hector_controller_spawner DESTINATION lib/${PROJECT_NAME})

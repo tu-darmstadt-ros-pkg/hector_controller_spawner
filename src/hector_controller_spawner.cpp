@@ -1,5 +1,6 @@
 #include "hector_controller_spawner/hector_controller_spawner.hpp"
 #include <functional>
+#include <unordered_set>
 
 namespace hector_controller_spawner
 {
