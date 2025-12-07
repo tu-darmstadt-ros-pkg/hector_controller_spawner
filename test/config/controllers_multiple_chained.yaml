@@ -23,14 +23,16 @@
         type: velocity_to_position_command_controller/VelocityToPositionCommandController
 
       flipper_safety_position_controller:
-        type: safety_position_controller/SafetyPositionController
+        # type: safety_position_controller/SafetyPositionController
+        type: safety_forward_controller/SafetyForwardController # works better in CI - no srdf required
 
       # --------- Arm Controllers ------------
       arm_trajectory_controller:
         type: joint_trajectory_controller/JointTrajectoryController
 
       arm_safety_position_controller:
-        type: safety_position_controller/SafetyPositionController
+        # type: safety_position_controller/SafetyPositionController
+        type: safety_forward_controller/SafetyForwardController # works better in CI - no srdf required
 
       moveit_twist_controller:
         type: moveit_twist_controller/MoveitTwistController
@@ -42,17 +44,14 @@
   flipper_safety_position_controller:
     ros__parameters:
       joints:
-      - flipper_fl_joint
-      - flipper_fr_joint
-      - flipper_bl_joint
-      - flipper_br_joint
+        - flipper_fl_joint
+        - flipper_fr_joint
+        - flipper_bl_joint
+        - flipper_br_joint
 
-      unwrap_continuous_joints: true
-      enforce_position_limits: true
-      check_self_collisions: true
-      collision_padding: 0.01 # in meters
-      debug_visualize_collisions: true
-      block_velocity_scaling: 3.0
+      passthrough_controller: ""
+
+      interface_type: position
 
 
 
@@ -103,19 +102,16 @@
   arm_safety_position_controller:
     ros__parameters:
       joints:
-      - arm_joint_1
-      - arm_joint_2
-      - arm_joint_3
-      - arm_joint_4
-      - arm_joint_5
-      - arm_joint_6
+        - arm_joint_1
+        - arm_joint_2
+        - arm_joint_3
+        - arm_joint_4
+        - arm_joint_5
+        - arm_joint_6
 
-      unwrap_continuous_joints: true
-      enforce_position_limits: true
-      set_current_limits: false
-      check_self_collisions: true
-      debug_visualize_collisions: true
-      block_velocity_scaling: 3.0
+      passthrough_controller: ""
+      interface_type: position
+
 
   arm_trajectory_controller:
     ros__parameters:
