@@ -36,6 +36,8 @@ if(BUILD_TESTING)
   add_launch_test(test/test_spawner_twice.test.py TIMEOUT 360)
   add_launch_test(test/test_spawner_estop.test.py TIMEOUT 360)
   add_launch_test(test/test_spawner_chain_detection.test.py TIMEOUT 360)
+  add_launch_test(test/test_spawner_multiple_chained.test.py TIMEOUT 360)
+  add_launch_test(test/test_spawner_start_partial_chain.test.py TIMEOUT 360)
 endif()
 
 install(TARGETS hector_controller_spawner DESTINATION lib/${PROJECT_NAME})

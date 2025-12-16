@@ -38,7 +38,10 @@ class MultiSpawner final : public rclcpp::Node
 {
 public:
   using ControllerGroup = std::vector<std::string>; // group of controllers to activate together
-
+  struct ControllerChainInfo {
+    std::vector<std::string> required_controllers; // controllers that must be started before this one
+    std::vector<std::string> upper_controllers;    // controllers that can be started after this one
+  };
   explicit MultiSpawner();
   void initialize();
   void start_sequence( bool initial_init );
@@ -70,8 +73,10 @@ private:
   void verifyFinalStates();
   void parseControllerInfo( const controller_manager_msgs::srv::ListControllers_Response &resp,
                             std::unordered_map<std::string, std::string> &current_state );
-  bool ensureControllerState( bool desired_state,
-                              const std::unordered_map<std::string, std::string> &current_state );
+  void checkRequiredControllersActive( const std::string &controller_name );
+  bool
+  validateDesiredControllerState( const controller_manager_msgs::srv::ListControllers_Response &resp );
+  bool activateControllers( const std::unordered_map<std::string, std::string> &current_state );
   bool
   deactivateAllActiveControllers( const std::unordered_map<std::string, std::string> &current_state );
   bool loadControllerGroup( const std::vector<std::string> &to_activate,
@@ -83,9 +88,8 @@ private:
   std::vector<std::string> hw_interfaces_;
   std::vector<std::string> controllers_;
   std::unordered_map<std::string, ControllerCfg> controller_cfg_;
-  std::vector<ControllerGroup> controller_groups_;
-  std::map<std::string, std::vector<std::string>>
-      chained_connections_; // controller name → controllers that depend on it
+  // std::vector<ControllerGroup> controller_groups_;
+  std::unordered_map<std::string, ControllerChainInfo> controller_info_;
   double retry_delay_{ 5.0 };
   double start_delay_{ 0.0 };
   std::string estop_topic_;

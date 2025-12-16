@@ -1,5 +1,6 @@
 #include "hector_controller_spawner/hector_controller_spawner.hpp"
 #include <functional>
+#include <unordered_set>
 
 namespace hector_controller_spawner
 {
@@ -237,7 +238,7 @@ void MultiSpawner::start_sequence( bool initial_init )
   // robuster to first deactivate and then re-activate in their respective groups
   deactivateAllActiveControllers( current_state );
 
-  // update current state
+  // update current state & check validity of desired state
   if ( list_ctrl_client_->wait_for_service( 2s ) ) {
     auto req = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
     auto fut = list_ctrl_client_->async_send_request( req );
@@ -245,10 +246,16 @@ void MultiSpawner::start_sequence( bool initial_init )
          rclcpp::FutureReturnCode::SUCCESS ) {
       auto resp = fut.get();
       parseControllerInfo( *resp, current_state );
+      if ( !validateDesiredControllerState( *resp ) ) {
+        RCLCPP_ERROR( get_logger(),
+                      "Desired controller state is not valid – aborting startup sequence." );
+        in_progress_ = false;
+        return;
+      }
     }
   }
   // 5) activate controllers that are requested
-  ensureControllerState( true, current_state );
+  activateControllers( current_state );
   // ===== Done =============================================================
   verifyFinalStates();
   RCLCPP_INFO( get_logger(), " Multi Controller Spawner complete – shutting down." );
@@ -256,77 +263,106 @@ void MultiSpawner::start_sequence( bool initial_init )
   in_progress_ = false;
 }
 
-bool MultiSpawner::ensureControllerState(
-    const bool desired_state, const std::unordered_map<std::string, std::string> &current_state )
+void MultiSpawner::checkRequiredControllersActive( const std::string &controller_name )
 {
-  bool success = true;
-  for ( const auto &group : controller_groups_ ) {
-    /* Determine whether at least one controller in this group should be active. */
-    bool group_requested_active = false; // if any controller in the group should be active
-    for ( const auto &m : group ) { group_requested_active |= controller_cfg_.at( m ).activate; }
-
-    // skip if the group is not requested to be in the desired state
-    if ( group_requested_active != desired_state ) {
-      RCLCPP_DEBUG( get_logger(), "Group %s should not be %s", vecToString( group ).c_str(),
-                    desired_state ? "activated" : "deactivated" );
-      continue;
+  for ( const auto &req : controller_info_.at( controller_name ).required_controllers ) {
+    if ( !controller_cfg_.at( req ).activate ) {
+      if ( controller_cfg_.at( req ).specified )
+        RCLCPP_WARN( get_logger(),
+                     "Controller '%s' requires controller '%s' to be active, but it is not "
+                     "requested to be active. Auto activating it.",
+                     controller_name.c_str(), req.c_str() );
+      controller_cfg_.at( req ).activate = true;
     }
-
-    /* Force any “false” members in the same group to active and warn once. */
-    for ( const auto &m : group ) {
-      if ( controller_cfg_.at( m ).activate != group_requested_active ) {
-        RCLCPP_DEBUG( get_logger(), "Controller '%s' is in group with ['%s'] → overriding to ACTIVE.",
-                      m.c_str(), vecToString( group ).c_str() );
-      }
-    }
-
-    /* Check if the group is already in the desired state. */
-    bool active = true;
-    bool inactive = true;
-    for ( const auto &m : group ) {
-      auto it = current_state.find( m );
-      active &= ( it != current_state.end() && it->second == "active" );
-      inactive &= ( it != current_state.end() && it->second != "active" );
-    }
-    if ( ( active && group_requested_active ) || ( inactive && !group_requested_active ) ) {
-      RCLCPP_DEBUG( get_logger(), "The group %s is already in the desired state %s",
-                    vecToString( group ).c_str(), desired_state ? "ACTIVE" : "INACTIVE" );
-      continue;
-    }
-
-    /* Issue one switch_controller call for this group. */
-    if ( ( group_requested_active && !loadControllerGroup( group, /*deactivate*/ {} ) ) ||
-         ( !group_requested_active && !loadControllerGroup( {}, group ) ) ) {
-      RCLCPP_ERROR( get_logger(), "Failed to %s controller group containing '%s'",
-                    group_requested_active ? "activate" : "deactivate",
-                    vecToString( group ).c_str() );
-      success = false;
-    } else {
-
-      RCLCPP_DEBUG( get_logger(), "%s controller group: %s",
-                    group_requested_active ? "Activated" : "Deactivated",
-                    vecToString( group ).c_str() );
+    // recursively check down the chain
+    checkRequiredControllersActive( req );
+  }
+}
+bool MultiSpawner::validateDesiredControllerState(
+    const controller_manager_msgs::srv::ListControllers_Response &resp )
+{
+  // check whether the desired controller state is possible
+  // all lower controllers in a chain must also be activated if an upper controller is activated
+  for ( const auto &[name, config] : controller_cfg_ ) {
+    if ( config.activate ) {
+      checkRequiredControllersActive( name );
     }
   }
+  // Interface check: no controllers that should be activated can share the same claimed command interfaces
+  std::unordered_map<std::string, std::string> req_interface_owners; // interface -> controller name
+  for ( const auto &c : resp.controller ) {
+    if ( !controller_cfg_.at( c.name ).activate ) {
+      // only care about controllers that should be active
+      continue;
+    }
+    for ( const auto &req_inf : c.required_command_interfaces ) {
+      if ( req_interface_owners.find( req_inf ) == req_interface_owners.end() ) {
+        req_interface_owners[req_inf] = c.name;
+      } else {
+        // already owned
+        const auto &owner = req_interface_owners[req_inf];
+        RCLCPP_ERROR( get_logger(),
+                      "Controllers '%s' and '%s' both require command interface '%s' and are both "
+                      "requested to be active. This is not possible.",
+                      owner.c_str(), c.name.c_str(), req_inf.c_str() );
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool MultiSpawner::activateControllers( const std::unordered_map<std::string, std::string> &current_state )
+{
+
+  std::vector<std::string> to_activate;
+  std::unordered_set<std::string> added;
+  std::function<void( const std::string & )> add_with_dependencies = [&]( const std::string &name ) {
+    if ( added.find( name ) != added.end() ) {
+      return;
+    }
+    const auto info_it = controller_info_.find( name );
+    if ( info_it != controller_info_.end() ) {
+      for ( const auto &req : info_it->second.required_controllers ) {
+        add_with_dependencies( req );
+      }
+    }
+    added.insert( name );
+    if ( current_state.count( name ) == 0 || current_state.at( name ) != "active" )
+      to_activate.push_back( name );
+  };
+  for ( const auto &[name, info] : controller_info_ ) {
+    if ( controller_cfg_[name].activate ) {
+      add_with_dependencies( name );
+    }
+  }
+  const bool success = loadControllerGroup( to_activate, {} );
   return success;
 }
 
 bool MultiSpawner::deactivateAllActiveControllers(
     const std::unordered_map<std::string, std::string> &current_state )
 {
-  bool success = true;
   std::vector<std::string> to_deactivate;
-  for ( const auto &group : controller_groups_ ) {
-    to_deactivate.clear();
-    // find active controllers in this group
-    for ( const auto &m : group ) {
-      if ( current_state.at( m ) == "active" ) {
-        to_deactivate.push_back( m );
+  std::unordered_set<std::string> added;
+  std::function<void( const std::string & )> add_with_dependents = [&]( const std::string &name ) {
+    if ( added.find( name ) != added.end() ) {
+      return;
+    }
+    const auto info_it = controller_info_.find( name );
+    if ( info_it != controller_info_.end() ) {
+      for ( const auto &upper : info_it->second.upper_controllers ) {
+        add_with_dependents( upper );
       }
     }
-    if ( !to_deactivate.empty() )
-      success &= loadControllerGroup( {}, to_deactivate );
-  }
+    added.insert( name );
+    if ( current_state.at( name ) == "active" )
+      to_deactivate.push_back( name );
+  };
+  for ( const auto &[name, info] : controller_info_ ) { add_with_dependents( name ); }
+  // reverse to deactivate from top to bottom
+  std::reverse( to_deactivate.begin(), to_deactivate.end() );
+  bool success = loadControllerGroup( {}, to_deactivate );
   return success;
 }
 
@@ -382,81 +418,19 @@ void MultiSpawner::parseControllerInfo(
   // save snapshot of states
   for ( const auto &c : resp.controller ) { current_state[c.name] = c.state; }
 
-  // —— auto-detect chained controllers groups ——
+  // parse controller chain info
   for ( const auto &c : resp.controller ) {
-    chained_connections_.erase( c.name );
+    controller_info_[c.name] = ControllerChainInfo();
     for ( const auto &conn : c.chain_connections ) {
-      chained_connections_[c.name].push_back( conn.name );
-      // check if there is a ControllerGroup that includes name or conn.name
-      bool found = false;
-      for ( auto &group : controller_groups_ ) {
-        if ( std::find( group.begin(), group.end(), c.name ) != group.end() ||
-             std::find( group.begin(), group.end(), conn.name ) != group.end() ) {
-          found = true;
-          if ( std::find( group.begin(), group.end(), c.name ) == group.end() ) {
-            group.push_back( c.name );
-          } else if ( std::find( group.begin(), group.end(), conn.name ) == group.end() ) {
-            group.push_back( conn.name );
-          }
-          break;
-        }
-      }
-      if ( !found ) {
-        // create a new group with both names
-        controller_groups_.emplace_back( std::vector{ c.name, conn.name } );
-      }
-      RCLCPP_DEBUG( get_logger(), "Controller Group Member: '%s' <-> '%s'", c.name.c_str(),
-                    conn.name.c_str() );
+      controller_info_[c.name].required_controllers.push_back( conn.name );
     }
   }
-  // add remaining controllers as their own groups
-  for ( const auto &c : resp.controller ) {
-    bool in_group = false;
-    for ( auto &group : controller_groups_ ) {
-      if ( std::find( group.begin(), group.end(), c.name ) != group.end() ) {
-        in_group = true;
-        break;
-      }
+
+  // get first upper direction
+  for ( auto &[name, info] : controller_info_ ) {
+    for ( const auto &conn_name : info.required_controllers ) {
+      controller_info_[conn_name].upper_controllers.push_back( name );
     }
-    if ( !in_group ) {
-      controller_groups_.emplace_back( std::vector<std::string>{ c.name } );
-      RCLCPP_DEBUG( get_logger(), "Controller Group Member: '%s' (single)", c.name.c_str() );
-    }
-  }
-  // check if all controllers have a controller cfg, if not add them with current state
-  for ( const auto &c : resp.controller ) {
-    if ( controller_cfg_.find( c.name ) == controller_cfg_.end() ) {
-      ControllerCfg cfg;
-      cfg.activate = ( c.state == "active" );
-      controller_cfg_[c.name] = cfg;
-      controllers_.push_back( c.name );
-      RCLCPP_DEBUG( get_logger(), "Adding controller '%s' with state '%s' to config.",
-                    c.name.c_str(), c.state.c_str() );
-    }
-  }
-  // add recursive chained connections
-  for ( auto &group : controller_groups_ ) {
-    bool changed = true;
-    while ( changed ) {
-      changed = false;
-      for ( const auto &ctrl : group ) {
-        for ( const auto &dependent_ctrl : chained_connections_[ctrl] ) {
-          for ( const auto &dep_dep_ctr : chained_connections_[dependent_ctrl] ) {
-            if ( std::find( chained_connections_[ctrl].begin(), chained_connections_[ctrl].end(),
-                            dep_dep_ctr ) == chained_connections_[ctrl].end() ) {
-              chained_connections_[ctrl].push_back( dep_dep_ctr );
-              changed = true;
-            }
-          }
-        }
-      }
-    }
-    // sort members in group by number of dependent controllers (descending)
-    std::sort( group.begin(), group.end(), [this]( const std::string &a, const std::string &b ) {
-      const size_t size_a = chained_connections_.count( a ) ? chained_connections_[a].size() : 0;
-      const size_t size_b = chained_connections_.count( b ) ? chained_connections_[b].size() : 0;
-      return size_a < size_b;
-    } );
   }
 }
 

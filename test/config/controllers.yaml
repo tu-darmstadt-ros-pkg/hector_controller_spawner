@@ -1,5 +1,3 @@
-# THIS PARAMETERS ARE ONLY USED IN THE SIMULATION !!!
-# SEE athena_driver_launch/athena_driver_launch_config/configs/controllers.yaml FOR THE REAL ROBOT CONFIGURATION
 /**:
   gz_ros_control:
     ros__parameters:
@@ -25,7 +23,6 @@
 
       gripper_trajectory_controller:
         type: joint_trajectory_controller/JointTrajectoryController
-
 
       vel_to_pos_controller:
         type: velocity_to_position_command_controller/VelocityToPositionCommandController
