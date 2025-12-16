@@ -1,15 +1,15 @@
 /**:
   ros__parameters:
     # Optional emergency‑stop topic.  Empty → start immediately.
-    estop_topic: ""
+    estop_topic: ''
 
     # How long to wait between retry attempts (HW + controllers).
     retry_delay: 5.0
 
     # ---------- hardware interfaces (activate = always) ----------
     hardware_interfaces:
-    - "athena_flipper_interface"
-    - "athena_arm_interface"
+    - athena_flipper_interface
+    - athena_arm_interface
     # ---------- controllers, in deterministic order -------------
     controllers:
     - joint_state_broadcaster
