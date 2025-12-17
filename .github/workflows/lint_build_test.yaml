@@ -58,6 +58,10 @@ jobs:
         path: src/hector_ros_controllers
     - uses: actions/checkout@v4
       with:
+        repository: tu-darmstadt-ros-pkg/ad_kinematics
+        path: src/ad_kinematics
+    - uses: actions/checkout@v4
+      with:
         path: src/repo
     - name: rosdep
       run: |
