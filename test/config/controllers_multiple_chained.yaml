@@ -44,12 +44,12 @@
   flipper_safety_position_controller:
     ros__parameters:
       joints:
-        - flipper_fl_joint
-        - flipper_fr_joint
-        - flipper_bl_joint
-        - flipper_br_joint
+      - flipper_fl_joint
+      - flipper_fr_joint
+      - flipper_bl_joint
+      - flipper_br_joint
 
-      passthrough_controller: ""
+      passthrough_controller: ''
 
       interface_type: position
 
@@ -102,26 +102,26 @@
   arm_safety_position_controller:
     ros__parameters:
       joints:
-        - arm_joint_1
-        - arm_joint_2
-        - arm_joint_3
-        - arm_joint_4
-        - arm_joint_5
-        - arm_joint_6
+      - arm_joint_1
+      - arm_joint_2
+      - arm_joint_3
+      - arm_joint_4
+      - arm_joint_5
+      - arm_joint_6
 
-      passthrough_controller: ""
+      passthrough_controller: ''
       interface_type: position
 
 
   arm_trajectory_controller:
     ros__parameters:
       joints:
-        - arm_joint_1
-        - arm_joint_2
-        - arm_joint_3
-        - arm_joint_4
-        - arm_joint_5
-        - arm_joint_6
+      - arm_joint_1
+      - arm_joint_2
+      - arm_joint_3
+      - arm_joint_4
+      - arm_joint_5
+      - arm_joint_6
 
       command_joints:
       - arm_safety_position_controller/arm_joint_1
@@ -132,10 +132,10 @@
       - arm_safety_position_controller/arm_joint_6
 
       command_interfaces:
-        - position
+      - position
       state_interfaces:
-        - position
-        - velocity
+      - position
+      - velocity
 
   gripper_trajectory_controller:
     ros__parameters:

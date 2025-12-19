@@ -8,17 +8,17 @@
 
     # ---------- hardware interfaces (activate = always) ----------
     hardware_interfaces:
-      - "athena_flipper_interface"
-      - "athena_arm_interface"
+    - athena_flipper_interface
+    - athena_arm_interface
 
     # ---------- controllers --------------------------------------
     controllers:
-      - joint_state_broadcaster
-      - flipper_trajectory_controller
-      - flipper_velocity_controller
-      - gripper_trajectory_controller
-      - arm_trajectory_controller
-      - vel_to_pos_controller
+    - joint_state_broadcaster
+    - flipper_trajectory_controller
+    - flipper_velocity_controller
+    - gripper_trajectory_controller
+    - arm_trajectory_controller
+    - vel_to_pos_controller
 
     # ---------- Per‑controller options ---------------------------
     joint_state_broadcaster:
