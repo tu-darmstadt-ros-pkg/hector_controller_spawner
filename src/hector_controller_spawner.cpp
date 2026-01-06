@@ -15,14 +15,25 @@ void MultiSpawner::initialize()
                                                                       std::vector<std::string>() );
   controllers_ =
       this->declare_parameter<std::vector<std::string>>( "controllers", std::vector<std::string>() );
-  retry_delay_ = this->declare_parameter<double>( "retry_delay", 5.0 );
-  start_delay_ = this->declare_parameter<double>( "start_delay", 0.0 );
+  retry_delay_param_sub_ = hector::createReconfigurableParameter(
+      shared_from_this(), "retry_delay", std::ref( retry_delay_ ), "Retry delay in seconds",
+      hector::ParameterOptions<double>().onValidate(
+          []( const auto &value ) { return value > 0.0; } ) );
+  start_delay_param_sub_ = hector::createReconfigurableParameter(
+      shared_from_this(), "start_delay", std::ref( start_delay_ ), "Start delay in seconds",
+      hector::ParameterOptions<double>().onValidate(
+          []( const auto &value ) { return value >= 0.0; } ) );
   estop_topic_ = this->declare_parameter<std::string>( "estop_topic", "" );
-  restart_after_estop_deactivation_ =
-      this->declare_parameter<bool>( "restart_after_estop_deactivation", true );
-  load_groups_one_by_one_ = this->declare_parameter<bool>( "load_groups_one_by_one", true );
-  int src_call_timeout_ms = this->declare_parameter<int>( "service_call_timeout_ms", 5000 );
-  srv_call_timeout_ = std::chrono::milliseconds( src_call_timeout_ms );
+  restart_after_estop_deactivation_param_sub_ = hector::createReconfigurableParameter(
+      shared_from_this(), "restart_after_estop_deactivation",
+      std::ref( restart_after_estop_deactivation_ ), "Restart after e-stop deactivation" );
+  load_groups_one_by_one_param_sub_ = hector::createReconfigurableParameter(
+      shared_from_this(), "load_groups_one_by_one", std::ref( load_groups_one_by_one_ ),
+      "Load controller groups one by one" );
+  service_call_timeout_ms_param_sub_ = hector::createReconfigurableParameter(
+      shared_from_this(), "service_call_timeout_ms", std::ref( service_call_timeout_ms_ ),
+      "Service call timeout in milliseconds",
+      hector::ParameterOptions<int>().onValidate( []( const auto &value ) { return value > 0; } ) );
   for ( const auto &ctrl : controllers_ ) {
     ControllerCfg cfg;
     cfg.activate = this->declare_parameter<bool>( ctrl + ".activate", true );
@@ -92,6 +103,13 @@ void MultiSpawner::start_sequence( bool initial_init )
 {
   in_progress_ = true;
 
+  if ( start_delay_ > 0.0 ) {
+    RCLCPP_INFO( get_logger(), "Delaying start sequence by %.1f seconds...", start_delay_ );
+    const auto delay = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>( start_delay_ ) );
+    rclcpp::sleep_for( delay );
+  }
+
   const auto sleep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>( retry_delay_ ) );
 
@@ -109,7 +127,7 @@ void MultiSpawner::start_sequence( bool initial_init )
     // test if hardware interfaces are available -> if not redo start sequence
     auto list_hw_fut = list_hardware_ctrl_client_->async_send_request(
         std::make_shared<controller_manager_msgs::srv::ListHardwareComponents::Request>() );
-    if ( rclcpp::spin_until_future_complete( shared_from_this(), list_hw_fut, srv_call_timeout_ ) !=
+    if ( rclcpp::spin_until_future_complete( shared_from_this(), list_hw_fut, serviceCallTimeout() ) !=
          rclcpp::FutureReturnCode::SUCCESS ) {
       RCLCPP_WARN( get_logger(), "Failed to list hardware components" );
     }
@@ -153,7 +171,7 @@ void MultiSpawner::start_sequence( bool initial_init )
   if ( list_ctrl_client_->wait_for_service( 2s ) ) {
     auto req = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
     auto fut = list_ctrl_client_->async_send_request( req );
-    if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, srv_call_timeout_ ) ==
+    if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) ==
          rclcpp::FutureReturnCode::SUCCESS ) {
       auto resp = fut.get();
       parseControllerInfo( *resp, current_state );
@@ -226,7 +244,7 @@ void MultiSpawner::start_sequence( bool initial_init )
     current_state.clear();
     auto req = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
     auto fut = list_ctrl_client_->async_send_request( req );
-    if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, srv_call_timeout_ ) ==
+    if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) ==
          rclcpp::FutureReturnCode::SUCCESS ) {
       auto resp = fut.get();
       parseControllerInfo( *resp, current_state );
@@ -242,7 +260,7 @@ void MultiSpawner::start_sequence( bool initial_init )
   if ( list_ctrl_client_->wait_for_service( 2s ) ) {
     auto req = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
     auto fut = list_ctrl_client_->async_send_request( req );
-    if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, srv_call_timeout_ ) ==
+    if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) ==
          rclcpp::FutureReturnCode::SUCCESS ) {
       auto resp = fut.get();
       parseControllerInfo( *resp, current_state );
@@ -406,7 +424,7 @@ bool MultiSpawner::switchControllersRequest( const std::vector<std::string> &to_
   req->timeout = rclcpp::Duration::from_seconds( 5.0 );
 
   auto fut = switch_ctrl_client_->async_send_request( req );
-  return rclcpp::spin_until_future_complete( shared_from_this(), fut, srv_call_timeout_ ) ==
+  return rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) ==
              rclcpp::FutureReturnCode::SUCCESS &&
          fut.get()->ok;
 }
@@ -448,7 +466,7 @@ bool MultiSpawner::loadAndActivateHardware( const std::string &name )
   act_req->target_state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
   act_req->target_state.label = "active";
   auto act_future = set_hw_state_client_->async_send_request( act_req );
-  if ( rclcpp::spin_until_future_complete( shared_from_this(), act_future, srv_call_timeout_ ) !=
+  if ( rclcpp::spin_until_future_complete( shared_from_this(), act_future, serviceCallTimeout() ) !=
        rclcpp::FutureReturnCode::SUCCESS ) {
     return false;
   }
@@ -463,7 +481,7 @@ bool MultiSpawner::loadController( const std::string &name )
   const auto req = std::make_shared<controller_manager_msgs::srv::LoadController::Request>();
   req->name = name;
   auto fut = load_ctrl_client_->async_send_request( req );
-  return rclcpp::spin_until_future_complete( shared_from_this(), fut, srv_call_timeout_ ) ==
+  return rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) ==
              rclcpp::FutureReturnCode::SUCCESS &&
          fut.get()->ok;
 }
@@ -475,7 +493,7 @@ bool MultiSpawner::configureController( const std::string &name )
   const auto req = std::make_shared<controller_manager_msgs::srv::ConfigureController::Request>();
   req->name = name;
   auto fut = configure_ctrl_client_->async_send_request( req );
-  return rclcpp::spin_until_future_complete( shared_from_this(), fut, srv_call_timeout_ ) ==
+  return rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) ==
              rclcpp::FutureReturnCode::SUCCESS &&
          fut.get()->ok;
 }
@@ -494,7 +512,7 @@ void MultiSpawner::verifyFinalStates()
 
   auto req = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
   auto fut = list_ctrl_client_->async_send_request( req );
-  if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, srv_call_timeout_ ) !=
+  if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) !=
        rclcpp::FutureReturnCode::SUCCESS ) {
     RCLCPP_WARN( get_logger(), "Failed to query controller states for final verification." );
     return;

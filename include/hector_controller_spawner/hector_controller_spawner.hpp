@@ -14,6 +14,7 @@
 #include <controller_manager_msgs/srv/load_controller.hpp>
 #include <controller_manager_msgs/srv/set_hardware_component_state.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
+#include <hector_ros2_utils/parameters/reconfigurable_parameter.hpp>
 #include <rclcpp/parameter_client.hpp>
 namespace hector_controller_spawner
 {
@@ -93,13 +94,24 @@ private:
   double retry_delay_{ 5.0 };
   double start_delay_{ 0.0 };
   std::string estop_topic_;
-  bool restart_after_estop_deactivation_{ false };
+  bool restart_after_estop_deactivation_{ true };
   bool load_groups_one_by_one_{ true };
-  std::chrono::milliseconds srv_call_timeout_{ 2000 };
+  int service_call_timeout_ms_{ 5000 };
+
+  hector::ParameterSubscription retry_delay_param_sub_;
+  hector::ParameterSubscription start_delay_param_sub_;
+  hector::ParameterSubscription restart_after_estop_deactivation_param_sub_;
+  hector::ParameterSubscription load_groups_one_by_one_param_sub_;
+  hector::ParameterSubscription service_call_timeout_ms_param_sub_;
 
   std::atomic<bool> in_progress_{ false };
   std::atomic<bool> done_{ false };
   std::atomic<bool> released_{ false };
+
+  std::chrono::milliseconds serviceCallTimeout() const
+  {
+    return std::chrono::milliseconds( service_call_timeout_ms_ );
+  }
 
   // ----- service clients -----
   rclcpp::Client<controller_manager_msgs::srv::SetHardwareComponentState>::SharedPtr set_hw_state_client_;

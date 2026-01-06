@@ -14,6 +14,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
+find_package(hector_ros2_utils REQUIRED)
 
 add_executable(hector_controller_spawner src/hector_controller_spawner.cpp)
 
@@ -23,7 +24,7 @@ target_include_directories(
          $<INSTALL_INTERFACE:include>)
 
 ament_target_dependencies(hector_controller_spawner rclcpp std_msgs
-                          controller_manager_msgs)
+                          controller_manager_msgs hector_ros2_utils)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
