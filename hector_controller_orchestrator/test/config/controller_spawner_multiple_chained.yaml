@@ -43,7 +43,5 @@
     arm_trajectory_controller:
       activate: true
 
-
-
     arm_safety_position_controller:
       activate: true

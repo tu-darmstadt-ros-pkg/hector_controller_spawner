@@ -131,14 +131,33 @@ protected:
     HectorTestFixture::TearDown();
   }
 
-  std::unordered_map<std::string, std::string> expected_initial_states() const
+  virtual std::unordered_map<std::string, std::string> expected_initial_states() const
   {
+    const std::string config_name = get_config_name();
+    if ( config_name == "Normal" ) {
+      return {
+          { "joint_state_broadcaster", "active" },
+          { "flipper_velocity_controller", "active" },
+          { "vel_to_pos_controller", "active" },
+          { "gripper_trajectory_controller", "active" },
+          { "arm_trajectory_controller", "active" },
+          { "flipper_trajectory_controller", "inactive" },
+      };
+    }
+    // case MultipleChained
     return {
-        { "joint_state_broadcaster", "active" },   { "flipper_velocity_controller", "active" },
-        { "vel_to_pos_controller", "active" },     { "gripper_trajectory_controller", "active" },
-        { "arm_trajectory_controller", "active" }, { "flipper_trajectory_controller", "inactive" },
+        { "joint_state_broadcaster", "active" },
+        { "flipper_velocity_controller", "active" },
+        { "vel_to_pos_controller", "active" },
+        { "gripper_trajectory_controller", "active" },
+        { "arm_trajectory_controller", "active" },
+        { "flipper_trajectory_controller", "inactive" },
+        { "arm_safety_position_controller", "active" },
+        { "flipper_safety_position_controller", "active" },
     };
   }
+
+  virtual std::string get_config_name() const = 0;
 
   bool wait_for_activity( const std::unordered_map<std::string, std::string> &expected,
                           std::chrono::nanoseconds timeout )
@@ -385,6 +404,8 @@ protected:
   {
     return ConfigType::get_config_files();
   }
+
+  std::string get_config_name() const override { return ConfigType::name(); }
 };
 
 // Executor type traits
@@ -596,6 +617,121 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsync )
          std::find( requested.begin(), requested.end(), pair.first ) == requested.end() ) {
       EXPECT_EQ( after_states.at( pair.first ), "active" );
     }
+  }
+}
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActive )
+{
+  // Edge case: trying to activate a controller that is already active should be a no-op
+  const std::vector<std::string> requested = { "flipper_velocity_controller" };
+
+  const auto before_resp = this->list_controllers();
+  ASSERT_NE( before_resp, nullptr );
+  const auto before_states = states_from_list( *before_resp );
+
+  // Verify flipper_velocity_controller is already active
+  ASSERT_EQ( before_states.at( "flipper_velocity_controller" ), "active" );
+
+  this->activity_sub_->reset();
+  std::atomic<bool> switch_done{ false };
+  bool switch_success = false;
+  std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
+    auto to_activate = requested;
+    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
+    switch_done = true;
+  } );
+
+  ASSERT_TRUE( this->executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
+  switch_thread.join();
+  ASSERT_TRUE( switch_success );
+
+  const auto after_resp = this->list_controllers();
+  ASSERT_NE( after_resp, nullptr );
+  const auto after_states = states_from_list( *after_resp );
+
+  // Verify nothing changed - controller still active, all other states unchanged
+  EXPECT_EQ( after_states.at( "flipper_velocity_controller" ), "active" );
+  for ( const auto &pair : before_states ) {
+    EXPECT_EQ( after_states.at( pair.first ), pair.second );
+  }
+}
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSeparateControllers )
+{
+  // Test activating two independent controllers simultaneously
+  // First deactivate gripper_trajectory_controller
+  ASSERT_TRUE( spin_while_executing( *this->executor_, []() { return true; } ) );
+
+  const std::string gripper_ctrl = "gripper_trajectory_controller";
+  ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &gripper_ctrl]() {
+    return this->orchestrator_->deactivateControllers( { gripper_ctrl }, 10 );
+  } ) );
+  ASSERT_TRUE( this->wait_for_list_states( { { gripper_ctrl, "inactive" } }, 20s ) );
+
+  // Now try to activate both flipper_trajectory_controller and gripper_trajectory_controller
+  const std::vector<std::string> requested = { "flipper_trajectory_controller",
+                                               "gripper_trajectory_controller" };
+
+  this->activity_sub_->reset();
+  std::atomic<bool> switch_done{ false };
+  bool switch_success = false;
+  std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
+    auto to_activate = requested;
+    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
+    switch_done = true;
+  } );
+
+  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" },
+                                          { "gripper_trajectory_controller", "active" } },
+                                        20s ) );
+  ASSERT_TRUE( this->executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
+  switch_thread.join();
+  ASSERT_TRUE( switch_success );
+
+  const auto after_resp = this->list_controllers();
+  ASSERT_NE( after_resp, nullptr );
+  const auto after_states = states_from_list( *after_resp );
+
+  // Both controllers should be active
+  EXPECT_EQ( after_states.at( "flipper_trajectory_controller" ), "active" );
+  EXPECT_EQ( after_states.at( "gripper_trajectory_controller" ), "active" );
+}
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchImpossibleCombination )
+{
+  // Test activating an impossible combination: flipper_trajectory_controller and
+  // vel_to_pos_controller These controllers are in the same chain but flipper_trajectory depends on
+  // safety controllers, so activating both the top of the chain and a middle controller should fail
+
+  const std::vector<std::string> requested = { "flipper_trajectory_controller",
+                                               "vel_to_pos_controller" };
+
+  const auto before_resp = this->list_controllers();
+  ASSERT_NE( before_resp, nullptr );
+  const auto before_states = states_from_list( *before_resp );
+
+  this->activity_sub_->reset();
+  std::atomic<bool> switch_done{ false };
+  bool switch_success = false;
+  std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
+    auto to_activate = requested;
+    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
+    switch_done = true;
+  } );
+
+  ASSERT_TRUE( this->executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
+  switch_thread.join();
+
+  // This combination should fail in analysis
+  ASSERT_FALSE( switch_success );
+
+  const auto after_resp = this->list_controllers();
+  ASSERT_NE( after_resp, nullptr );
+  const auto after_states = states_from_list( *after_resp );
+
+  // Verify nothing changed - all states should be identical to before
+  for ( const auto &pair : before_states ) {
+    EXPECT_EQ( after_states.at( pair.first ), pair.second );
   }
 }
 
