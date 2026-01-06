@@ -22,6 +22,7 @@
   <test_depend>hector_controller_spawner</test_depend>
   <test_depend>hector_testing_utils</test_depend>
   <test_depend>lifecycle_msgs</test_depend>
+  <test_depend>realtime_tools</test_depend>
   <test_depend>robot_state_publisher</test_depend>
 
   <export>

@@ -79,7 +79,6 @@ private:
       std::shared_ptr<std::vector<std::string>> controllers_to_deactivate, size_t index,
       const std::function<void( bool success, const std::string &message )> &callback ) const;
   rclcpp::Node::SharedPtr node_;
-  rclcpp::CallbackGroup::SharedPtr callback_group_;
   std::string controller_manager_name_;
   rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr list_controllers_client_;
   rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_controller_client_;

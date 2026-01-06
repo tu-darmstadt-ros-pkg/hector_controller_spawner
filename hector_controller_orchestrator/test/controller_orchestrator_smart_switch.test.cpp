@@ -3,22 +3,20 @@
 #include <controller_manager/controller_manager.hpp>
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
+#include <hector_controller_spawner/hector_controller_spawner.hpp>
 #include <hector_testing_utils/hector_testing_utils.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <realtime_tools/realtime_helpers.hpp>
 
 #include <controller_orchestrator/controller_orchestrator.hpp>
-
-#include <ament_index_cpp/get_package_prefix.hpp>
-
-#include <signal.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstring>
+#include <errno.h>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -33,10 +31,10 @@ using hector_testing_utils::HectorTestFixture;
 
 using namespace std::chrono_literals;
 
-extern char **environ;
-
 namespace
 {
+
+constexpr int kSchedPriority = 50;
 
 std::string load_file( const std::string &path )
 {
@@ -188,10 +186,34 @@ protected:
 
     cm_executor_->add_node( controller_manager_ );
 
+    const bool use_sim_time = controller_manager_->get_parameter_or( "use_sim_time", false );
+    const bool has_realtime = realtime_tools::has_realtime_kernel();
+    const bool lock_memory =
+        controller_manager_->get_parameter_or<bool>( "lock_memory", has_realtime );
+    if ( lock_memory ) {
+      const auto lock_result = realtime_tools::lock_memory();
+      if ( !lock_result.first ) {
+        RCLCPP_WARN( controller_manager_->get_logger(), "Unable to lock the memory: '%s'",
+                     lock_result.second.c_str() );
+      }
+    }
+
+    RCLCPP_INFO( controller_manager_->get_logger(), "update rate is %d Hz",
+                 controller_manager_->get_update_rate() );
+    const bool manage_overruns =
+        controller_manager_->get_parameter_or<bool>( "overruns.manage", true );
+    RCLCPP_INFO( controller_manager_->get_logger(), "Overruns handling is : %s",
+                 manage_overruns ? "enabled" : "disabled" );
+    const int thread_priority =
+        controller_manager_->get_parameter_or<int>( "thread_priority", kSchedPriority );
+    RCLCPP_INFO( controller_manager_->get_logger(),
+                 "Spawning %s RT thread with scheduler priority: %d",
+                 controller_manager_->get_name(), thread_priority );
+
     cm_running_ = true;
     cm_spin_thread_ = std::thread( [this]() { cm_executor_->spin(); } );
 
-    start_update_loop();
+    start_update_loop( use_sim_time, manage_overruns, thread_priority );
 
     activity_sub_ = tester_node_->create_test_subscription<ControllerManagerActivity>(
         "/controller_manager/activity" );
@@ -201,16 +223,16 @@ protected:
     ASSERT_TRUE( list_client_->wait_for_service( *executor_, 10s ) );
 
     orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
-        tester_node_, "controller_manager" );
+        tester_node_, "/controller_manager" );
 
-    ASSERT_TRUE( start_spawner_process() );
+    ASSERT_TRUE( start_spawner_node() );
 
     ASSERT_TRUE( wait_for_activity( expected_initial_states(), 30s ) );
   }
 
   void TearDown() override
   {
-    stop_spawner_process();
+    stop_spawner_node();
     stop_controller_manager();
     HectorTestFixture::TearDown();
   }
@@ -250,80 +272,104 @@ protected:
                                                                 *executor_, options );
   }
 
-  void start_update_loop()
+  void start_update_loop( bool use_sim_time, bool manage_overruns, int thread_priority )
   {
-    double update_rate = 50.0;
-    if ( controller_manager_->has_parameter( "update_rate" ) ) {
-      controller_manager_->get_parameter( "update_rate", update_rate );
-    }
-    if ( update_rate <= 0.0 ) {
-      update_rate = 50.0;
-    }
-    const auto period = std::chrono::duration<double>( 1.0 / update_rate );
+    cm_update_thread_ = std::thread( [this, use_sim_time, manage_overruns, thread_priority]() {
+      rclcpp::Parameter cpu_affinity_param;
+      if ( controller_manager_->get_parameter( "cpu_affinity", cpu_affinity_param ) ) {
+        std::vector<int> cpus;
+        if ( cpu_affinity_param.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER ) {
+          cpus = { static_cast<int>( cpu_affinity_param.as_int() ) };
+        } else if ( cpu_affinity_param.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER_ARRAY ) {
+          const auto cpu_affinity_param_array = cpu_affinity_param.as_integer_array();
+          for ( const auto cpu : cpu_affinity_param_array ) {
+            cpus.push_back( static_cast<int>( cpu ) );
+          }
+        }
+        const auto affinity_result = realtime_tools::set_current_thread_affinity( cpus );
+        if ( !affinity_result.first ) {
+          RCLCPP_WARN( controller_manager_->get_logger(), "Unable to set the CPU affinity : '%s'",
+                       affinity_result.second.c_str() );
+        }
+      }
 
-    cm_update_thread_ = std::thread( [this, period]() {
-      rclcpp::Clock clock( RCL_SYSTEM_TIME );
-      auto last_time = clock.now();
-      while ( cm_running_ ) {
-        auto now = clock.now();
-        auto dt = now - last_time;
-        controller_manager_->read( now, dt );
-        controller_manager_->update( now, dt );
-        controller_manager_->write( now, dt );
-        last_time = now;
-        std::this_thread::sleep_for( period );
+      if ( !realtime_tools::configure_sched_fifo( thread_priority ) ) {
+        RCLCPP_WARN(
+            controller_manager_->get_logger(),
+            "Could not enable FIFO RT scheduling policy: with error number <%i>(%s). See "
+            "[https://control.ros.org/master/doc/ros2_control/controller_manager/doc/userdoc.html] "
+            "for details on how to enable realtime scheduling.",
+            errno, std::strerror( errno ) );
+      } else {
+        RCLCPP_INFO( controller_manager_->get_logger(),
+                     "Successful set up FIFO RT scheduling policy with priority %i.",
+                     thread_priority );
+      }
+
+      controller_manager_->get_clock()->wait_until_started();
+      controller_manager_->get_clock()->sleep_for(
+          rclcpp::Duration::from_seconds( 1.0 / controller_manager_->get_update_rate() ) );
+
+      const auto period =
+          std::chrono::nanoseconds( 1'000'000'000 / controller_manager_->get_update_rate() );
+      rclcpp::Time previous_time = controller_manager_->get_trigger_clock()->now();
+      std::this_thread::sleep_for( period );
+
+      std::chrono::steady_clock::time_point next_iteration_time{ std::chrono::steady_clock::now() };
+
+      while ( cm_running_ && rclcpp::ok() ) {
+        const auto current_time = controller_manager_->get_trigger_clock()->now();
+        const auto measured_period = current_time - previous_time;
+        previous_time = current_time;
+
+        controller_manager_->read( current_time, measured_period );
+        controller_manager_->update( current_time, measured_period );
+        controller_manager_->write( current_time, measured_period );
+
+        if ( use_sim_time ) {
+          controller_manager_->get_clock()->sleep_until( current_time + period );
+        } else {
+          next_iteration_time += period;
+          const auto time_now = std::chrono::steady_clock::now();
+          if ( manage_overruns && next_iteration_time < time_now ) {
+            const double time_diff =
+                static_cast<double>( std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         time_now - next_iteration_time )
+                                         .count() ) /
+                1.e6;
+            const double cm_period =
+                1.e3 / static_cast<double>( controller_manager_->get_update_rate() );
+            const int overrun_count = static_cast<int>( std::ceil( time_diff / cm_period ) );
+            RCLCPP_WARN_THROTTLE(
+                controller_manager_->get_logger(), *controller_manager_->get_clock(), 1000,
+                "Overrun detected! The controller manager missed its desired rate of %d Hz. The "
+                "loop took %f ms (missed cycles : %d).",
+                controller_manager_->get_update_rate(), time_diff + cm_period, overrun_count + 1 );
+            next_iteration_time += ( overrun_count * period );
+          }
+          std::this_thread::sleep_until( next_iteration_time );
+        }
       }
     } );
   }
 
-  bool start_spawner_process()
+  bool start_spawner_node()
   {
-    const std::string prefix = ament_index_cpp::get_package_prefix( "hector_controller_spawner" );
-    spawner_path_ = prefix + "/lib/hector_controller_spawner/hector_controller_spawner";
-
     auto spawner_options = hector_testing_utils::node_options_from_yaml( spawner_yaml_ );
-    const auto &args = spawner_options.arguments();
-
-    std::vector<std::string> argv_storage;
-    argv_storage.reserve( args.size() + 1 );
-    argv_storage.push_back( spawner_path_ );
-    for ( const auto &arg : args ) { argv_storage.push_back( arg ); }
-
-    std::vector<char *> argv;
-    argv.reserve( argv_storage.size() + 1 );
-    for ( auto &arg : argv_storage ) { argv.push_back( arg.data() ); }
-    argv.push_back( nullptr );
-
-    int status =
-        posix_spawn( &spawner_pid_, spawner_path_.c_str(), nullptr, nullptr, argv.data(), environ );
-    if ( status != 0 ) {
-      spawner_pid_ = -1;
-      return false;
-    }
+    spawner_options.automatically_declare_parameters_from_overrides( false );
+    spawner_node_ = std::make_shared<hector_controller_spawner::MultiSpawner>( spawner_options );
+    spawner_node_->initialize();
+    spawner_node_->start_sequence( true );
+    executor_->add_node( spawner_node_ );
     return true;
   }
 
-  void stop_spawner_process()
+  void stop_spawner_node()
   {
-    if ( spawner_pid_ <= 0 ) {
+    if ( !spawner_node_ ) {
       return;
     }
-
-    int status = 0;
-    if ( waitpid( spawner_pid_, &status, WNOHANG ) == 0 ) {
-      kill( spawner_pid_, SIGINT );
-      for ( int i = 0; i < 50; ++i ) {
-        if ( waitpid( spawner_pid_, &status, WNOHANG ) != 0 ) {
-          break;
-        }
-        std::this_thread::sleep_for( 100ms );
-      }
-      if ( waitpid( spawner_pid_, &status, WNOHANG ) == 0 ) {
-        kill( spawner_pid_, SIGKILL );
-        waitpid( spawner_pid_, &status, 0 );
-      }
-    }
-    spawner_pid_ = -1;
+    spawner_node_.reset();
   }
 
   void stop_controller_manager()
@@ -345,7 +391,6 @@ protected:
   std::string controllers_yaml_;
   std::string spawner_yaml_;
   std::string urdf_path_;
-  std::string spawner_path_;
 
   std::atomic<bool> cm_running_{ false };
   std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> cm_executor_;
@@ -353,9 +398,8 @@ protected:
   std::thread cm_spin_thread_;
   std::thread cm_update_thread_;
 
-  pid_t spawner_pid_{ -1 };
-
   std::shared_ptr<controller_orchestrator::ControllerOrchestrator> orchestrator_;
+  std::shared_ptr<hector_controller_spawner::MultiSpawner> spawner_node_;
   std::shared_ptr<hector_testing_utils::TestSubscription<ControllerManagerActivity>> activity_sub_;
   std::shared_ptr<hector_testing_utils::TestClient<ListControllers>> list_client_;
 };
@@ -368,10 +412,18 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchSync )
 
   const auto expected_deactivate = compute_expected_deactivation( *before_resp, requested );
 
-  auto to_activate = requested;
   activity_sub_->reset();
-  ASSERT_TRUE( orchestrator_->smartSwitchController( to_activate, 10, true ) );
+  std::atomic<bool> switch_done{ false };
+  bool switch_success = false;
+  std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
+    auto to_activate = requested;
+    switch_success = orchestrator_->smartSwitchController( to_activate, 10, true );
+    switch_done = true;
+  } );
   ASSERT_TRUE( wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
+  ASSERT_TRUE( executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
+  switch_thread.join();
+  ASSERT_TRUE( switch_success );
 
   const auto after_resp = list_controllers();
   ASSERT_NE( after_resp, nullptr );
@@ -399,10 +451,18 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchSync )
 TEST_F( ControllerOrchestratorFixture, SmartSwitchAsync )
 {
   const std::vector<std::string> first = { "flipper_trajectory_controller" };
-  auto to_activate = first;
   activity_sub_->reset();
-  ASSERT_TRUE( orchestrator_->smartSwitchController( to_activate, 10, true ) );
+  std::atomic<bool> initial_done{ false };
+  bool initial_success = false;
+  std::thread initial_thread( [this, &first, &initial_done, &initial_success]() {
+    auto to_activate = first;
+    initial_success = orchestrator_->smartSwitchController( to_activate, 10, true );
+    initial_done = true;
+  } );
   ASSERT_TRUE( wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
+  ASSERT_TRUE( executor_->spin_until( [&initial_done]() { return initial_done.load(); }, 20s ) );
+  initial_thread.join();
+  ASSERT_TRUE( initial_success );
 
   const std::vector<std::string> requested = { "flipper_velocity_controller" };
   const auto before_resp = list_controllers();
@@ -414,18 +474,21 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchAsync )
   std::string async_message;
 
   activity_sub_->reset();
-  orchestrator_->smartSwitchControllerAsync(
-      requested,
-      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
-        async_success = success;
-        async_message = message;
-        callback_done = true;
-      },
-      true );
+  std::thread async_thread( [this, &requested, &callback_done, &async_success, &async_message]() {
+    orchestrator_->smartSwitchControllerAsync(
+        requested,
+        [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
+          async_success = success;
+          async_message = message;
+          callback_done = true;
+        },
+        true );
+  } );
 
-  ASSERT_TRUE( executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
-  ASSERT_TRUE( async_success ) << async_message;
   ASSERT_TRUE( wait_for_activity( { { "flipper_velocity_controller", "active" } }, 20s ) );
+  ASSERT_TRUE( executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
+  async_thread.join();
+  ASSERT_TRUE( async_success ) << async_message;
 
   const auto after_resp = list_controllers();
   ASSERT_NE( after_resp, nullptr );

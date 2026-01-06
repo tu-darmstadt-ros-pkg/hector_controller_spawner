@@ -78,6 +78,8 @@ if(BUILD_TESTING)
   find_package(controller_manager REQUIRED)
   find_package(hector_testing_utils REQUIRED)
   find_package(lifecycle_msgs REQUIRED)
+  find_package(realtime_tools REQUIRED)
+  find_package(hector_controller_spawner REQUIRED)
 
   ament_lint_auto_find_test_dependencies()
 
@@ -93,8 +95,10 @@ if(BUILD_TESTING)
     ament_index_cpp
     controller_manager
     controller_manager_msgs
+    hector_controller_spawner
     hector_testing_utils
     lifecycle_msgs
+    realtime_tools
     rclcpp
     std_msgs)
 endif()

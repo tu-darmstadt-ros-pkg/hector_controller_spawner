@@ -57,16 +57,13 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
                                                 const std::string &controller_manager_name )
     : node_( node ), controller_manager_name_( controller_manager_name )
 {
-  callback_group_ = node_->create_callback_group( rclcpp::CallbackGroupType::Reentrant );
   list_controllers_client_ = node_->create_client<ListControllers>(
-      controller_manager_name_ + "/list_controllers", rclcpp::QoS( 10 ), callback_group_ );
+      controller_manager_name_ + "/list_controllers", rclcpp::ServicesQoS() );
   switch_controller_client_ = node_->create_client<SwitchController>(
-      controller_manager_name_ + "/switch_controller", rclcpp::QoS( 10 ), callback_group_ );
+      controller_manager_name_ + "/switch_controller", rclcpp::ServicesQoS() );
   list_hardware_components_client_ =
       node_->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
-          controller_manager_name_ + "/list_hardware_components", rclcpp::QoS( 10 ), callback_group_ );
-  rclcpp::SubscriptionOptions sub_options;
-  sub_options.callback_group = callback_group_;
+          controller_manager_name_ + "/list_hardware_components", rclcpp::ServicesQoS() );
   activity_subscription_ =
       node_->create_subscription<controller_manager_msgs::msg::ControllerManagerActivity>(
           controller_manager_name_ + "/activity", rclcpp::QoS( 10 ),
@@ -79,8 +76,7 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
             for ( const auto &controller : msg->controllers ) {
               controller_states_[controller.name] = lifecycleStateLabel( controller.state );
             }
-          },
-          sub_options );
+          } );
 }
 
 void ControllerOrchestrator::smartSwitchControllerAsync(

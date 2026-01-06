@@ -44,6 +44,7 @@ public:
     std::vector<std::string> upper_controllers;    // controllers that can be started after this one
   };
   explicit MultiSpawner();
+  explicit MultiSpawner( const rclcpp::NodeOptions &options );
   void initialize();
   void start_sequence( bool initial_init );
   bool is_tracking_estop() const noexcept { return !estop_topic_.empty(); }

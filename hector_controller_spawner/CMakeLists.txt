@@ -16,13 +16,19 @@ find_package(std_msgs REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
 find_package(hector_ros2_utils REQUIRED)
 
-add_executable(hector_controller_spawner src/hector_controller_spawner.cpp)
+add_library(hector_controller_spawner_lib SHARED
+            src/hector_controller_spawner.cpp)
 
 target_include_directories(
-  hector_controller_spawner
+  hector_controller_spawner_lib
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
          $<INSTALL_INTERFACE:include>)
 
+ament_target_dependencies(hector_controller_spawner_lib rclcpp std_msgs
+                          controller_manager_msgs hector_ros2_utils)
+
+add_executable(hector_controller_spawner src/hector_controller_spawner_main.cpp)
+target_link_libraries(hector_controller_spawner hector_controller_spawner_lib)
 ament_target_dependencies(hector_controller_spawner rclcpp std_msgs
                           controller_manager_msgs hector_ros2_utils)
 
@@ -41,11 +47,25 @@ if(BUILD_TESTING)
   add_launch_test(test/test_spawner_start_partial_chain.test.py TIMEOUT 360)
 endif()
 
+install(
+  TARGETS hector_controller_spawner_lib
+  EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME})
+
 install(TARGETS hector_controller_spawner DESTINATION lib/${PROJECT_NAME})
+
+install(DIRECTORY include/ DESTINATION include)
 
 install(
   DIRECTORY config launch test
   DESTINATION share/${PROJECT_NAME}
   OPTIONAL)
+
+ament_export_include_directories(include)
+ament_export_dependencies(rclcpp std_msgs controller_manager_msgs
+                          hector_ros2_utils)
+ament_export_targets(export_${PROJECT_NAME})
 
 ament_package()
