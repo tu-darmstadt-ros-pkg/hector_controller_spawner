@@ -50,8 +50,9 @@ protected:
   {
     HectorTestFixture::SetUp();
 
-    controllers_yaml_ = std::string( TEST_CONFIG_DIR ) + "/controllers.yaml";
-    spawner_yaml_ = std::string( TEST_CONFIG_DIR ) + "/controller_spawner.yaml";
+    const auto config_files = get_config_files();
+    controllers_yaml_ = config_files.first;
+    spawner_yaml_ = config_files.second;
     urdf_path_ = std::string( TEST_CONFIG_DIR ) + "/athena.urdf";
 
     const std::string urdf = load_file( urdf_path_ );
@@ -347,48 +348,142 @@ protected:
   std::shared_ptr<hector_testing_utils::TestClient<ListControllers>> list_client_;
 
   virtual std::shared_ptr<rclcpp::Executor> create_cm_executor() = 0;
+  virtual std::pair<std::string, std::string> get_config_files() const = 0;
 };
 
-class ControllerOrchestratorFixture : public ControllerOrchestratorFixtureBase
+// Configuration traits for normal config
+struct NormalConfig {
+  static std::pair<std::string, std::string> get_config_files()
+  {
+    return { std::string( TEST_CONFIG_DIR ) + "/controllers.yaml",
+             std::string( TEST_CONFIG_DIR ) + "/controller_spawner.yaml" };
+  }
+  static const char *name() { return "Normal"; }
+};
+
+// Configuration traits for multiple chained config
+struct MultipleChainedConfig {
+  static std::pair<std::string, std::string> get_config_files()
+  {
+    return { std::string( TEST_CONFIG_DIR ) + "/controllers_multiple_chained.yaml",
+             std::string( TEST_CONFIG_DIR ) + "/controller_spawner_multiple_chained.yaml" };
+  }
+  static const char *name() { return "MultipleChained"; }
+};
+
+// Base template fixture combining executor type and config type
+template<typename ExecutorType, typename ConfigType>
+class ControllerOrchestratorFixtureTemplate : public ControllerOrchestratorFixtureBase
 {
 protected:
   std::shared_ptr<rclcpp::Executor> create_cm_executor() override
+  {
+    return ExecutorType::create_executor();
+  }
+
+  std::pair<std::string, std::string> get_config_files() const override
+  {
+    return ConfigType::get_config_files();
+  }
+};
+
+// Executor type traits
+struct MultiThreadedExecutorType {
+  static std::shared_ptr<rclcpp::Executor> create_executor()
   {
     return std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
   }
+  static const char *name() { return "MultiThreaded"; }
 };
 
-class ControllerOrchestratorSingleThreadedFixture : public ControllerOrchestratorFixtureBase
-{
-protected:
-  std::shared_ptr<rclcpp::Executor> create_cm_executor() override
+struct SingleThreadedExecutorType {
+  static std::shared_ptr<rclcpp::Executor> create_executor()
   {
     return std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
   }
+  static const char *name() { return "SingleThreaded"; }
 };
 
-TEST_F( ControllerOrchestratorFixture, SmartSwitchSync )
+// ---------------------------------------------------------------------------
+// Test parameter combinations (Executor × Config)
+// ---------------------------------------------------------------------------
+struct NormalMultiThreaded {
+  using ExecutorType = MultiThreadedExecutorType;
+  using ConfigType = NormalConfig;
+};
+
+struct NormalSingleThreaded {
+  using ExecutorType = SingleThreadedExecutorType;
+  using ConfigType = NormalConfig;
+};
+
+struct MultipleChainedMultiThreaded {
+  using ExecutorType = MultiThreadedExecutorType;
+  using ConfigType = MultipleChainedConfig;
+};
+
+struct MultipleChainedSingleThreaded {
+  using ExecutorType = SingleThreadedExecutorType;
+  using ConfigType = MultipleChainedConfig;
+};
+
+// Typed fixture that wires executor/config combos into the common base
+template<typename Param>
+class ControllerOrchestratorTypedFixture
+    : public ControllerOrchestratorFixtureTemplate<typename Param::ExecutorType, typename Param::ConfigType>
+{
+protected:
+  using Base =
+      ControllerOrchestratorFixtureTemplate<typename Param::ExecutorType, typename Param::ConfigType>;
+  using Base::activity_sub_;
+  using Base::controller_manager_;
+  using Base::executor_;
+  using Base::get_number_of_active_controllers;
+  using Base::list_controllers;
+  using Base::orchestrator_;
+  using Base::spawner_node_;
+  using Base::wait_for_activity;
+  using Base::wait_for_list_states;
+};
+
+// Pretty type names for gtest
+struct ControllerOrchestratorTestName {
+  template<typename T>
+  static std::string GetName( int )
+  {
+    return std::string( T::ConfigType::name() ) + "_" + T::ExecutorType::name();
+  }
+};
+
+using ControllerOrchestratorTestTypes =
+    ::testing::Types<NormalMultiThreaded, NormalSingleThreaded, MultipleChainedMultiThreaded,
+                     MultipleChainedSingleThreaded>;
+
+TYPED_TEST_SUITE( ControllerOrchestratorTypedFixture, ControllerOrchestratorTestTypes,
+                  ControllerOrchestratorTestName );
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSync )
 {
   const std::vector<std::string> requested = { "flipper_trajectory_controller" };
-  const auto before_resp = list_controllers();
+  const auto before_resp = this->list_controllers();
   ASSERT_NE( before_resp, nullptr );
 
   const auto expected_deactivate = compute_expected_deactivation( *before_resp, requested );
 
-  activity_sub_->reset();
+  this->activity_sub_->reset();
   std::atomic<bool> switch_done{ false };
   bool switch_success = false;
   std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
     auto to_activate = requested;
-    switch_success = orchestrator_->smartSwitchController( to_activate, 10, true );
+    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
     switch_done = true;
   } );
-  ASSERT_TRUE( wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
-  ASSERT_TRUE( executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
+  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
+  ASSERT_TRUE( this->executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
   switch_thread.join();
   ASSERT_TRUE( switch_success );
 
-  const auto after_resp = list_controllers();
+  const auto after_resp = this->list_controllers();
   ASSERT_NE( after_resp, nullptr );
 
   const auto before_states = states_from_list( *before_resp );
@@ -411,17 +506,17 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchSync )
   }
 }
 
-TEST_F( ControllerOrchestratorSingleThreadedFixture, SmartSwitchAsyncSingleThreadedExecutor )
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsyncSingleThreadedExecutor )
 {
   const std::vector<std::string> requested = { "flipper_trajectory_controller" };
 
-  activity_sub_->reset();
+  this->activity_sub_->reset();
   std::atomic<bool> callback_done{ false };
   bool async_success = false;
   std::string async_message;
 
   std::thread async_thread( [this, &requested, &callback_done, &async_success, &async_message]() {
-    orchestrator_->smartSwitchControllerAsync(
+    this->orchestrator_->smartSwitchControllerAsync(
         requested,
         [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
           async_success = success;
@@ -431,30 +526,31 @@ TEST_F( ControllerOrchestratorSingleThreadedFixture, SmartSwitchAsyncSingleThrea
         true );
   } );
 
-  ASSERT_TRUE( wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
-  ASSERT_TRUE( executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
+  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
+  ASSERT_TRUE(
+      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
   async_thread.join();
   ASSERT_TRUE( async_success ) << async_message;
 }
 
-TEST_F( ControllerOrchestratorFixture, SmartSwitchAsync )
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsync )
 {
   const std::vector<std::string> first = { "flipper_trajectory_controller" };
-  activity_sub_->reset();
+  this->activity_sub_->reset();
   std::atomic<bool> initial_done{ false };
   bool initial_success = false;
   std::thread initial_thread( [this, &first, &initial_done, &initial_success]() {
     auto to_activate = first;
-    initial_success = orchestrator_->smartSwitchController( to_activate, 10, true );
+    initial_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
     initial_done = true;
   } );
-  ASSERT_TRUE( wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
-  ASSERT_TRUE( executor_->spin_until( [&initial_done]() { return initial_done.load(); }, 20s ) );
+  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
+  ASSERT_TRUE( this->executor_->spin_until( [&initial_done]() { return initial_done.load(); }, 20s ) );
   initial_thread.join();
   ASSERT_TRUE( initial_success );
 
   const std::vector<std::string> requested = { "flipper_velocity_controller" };
-  const auto before_resp = list_controllers();
+  const auto before_resp = this->list_controllers();
   ASSERT_NE( before_resp, nullptr );
   const auto expected_deactivate = compute_expected_deactivation( *before_resp, requested );
 
@@ -462,9 +558,9 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchAsync )
   bool async_success = false;
   std::string async_message;
 
-  activity_sub_->reset();
+  this->activity_sub_->reset();
   std::thread async_thread( [this, &requested, &callback_done, &async_success, &async_message]() {
-    orchestrator_->smartSwitchControllerAsync(
+    this->orchestrator_->smartSwitchControllerAsync(
         requested,
         [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
           async_success = success;
@@ -474,12 +570,13 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchAsync )
         true );
   } );
 
-  ASSERT_TRUE( wait_for_activity( { { "flipper_velocity_controller", "active" } }, 20s ) );
-  ASSERT_TRUE( executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
+  ASSERT_TRUE( this->wait_for_activity( { { "flipper_velocity_controller", "active" } }, 20s ) );
+  ASSERT_TRUE(
+      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
   async_thread.join();
   ASSERT_TRUE( async_success ) << async_message;
 
-  const auto after_resp = list_controllers();
+  const auto after_resp = this->list_controllers();
   ASSERT_NE( after_resp, nullptr );
 
   const auto before_states = states_from_list( *before_resp );
@@ -502,41 +599,44 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchAsync )
   }
 }
 
-TEST_F( ControllerOrchestratorFixture, RefreshControllerStates )
+TYPED_TEST( ControllerOrchestratorTypedFixture, RefreshControllerStates )
 {
   ASSERT_TRUE( spin_while_executing(
-      *executor_, [this]() { return orchestrator_->refreshControllerStates( 10 ); } ) );
+      *this->executor_, [this]() { return this->orchestrator_->refreshControllerStates( 10 ); } ) );
 }
 
-TEST_F( ControllerOrchestratorFixture, ActivateDeactivateControllers )
+TYPED_TEST( ControllerOrchestratorTypedFixture, ActivateDeactivateControllers )
 {
   const std::string controller = "gripper_trajectory_controller";
 
-  const auto before_resp = list_controllers();
+  const auto before_resp = this->list_controllers();
   ASSERT_NE( before_resp, nullptr );
   const auto before_states = states_from_list( *before_resp );
   ASSERT_EQ( before_states.at( controller ), "active" );
 
-  ASSERT_TRUE( spin_while_executing( *executor_, [this, &controller]() {
-    return orchestrator_->deactivateControllers( { controller }, 10 );
+  ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &controller]() {
+    return this->orchestrator_->deactivateControllers( { controller }, 10 );
   } ) );
-  ASSERT_TRUE( wait_for_list_states( { { controller, "inactive" } }, 20s ) );
+  ASSERT_TRUE( this->wait_for_list_states( { { controller, "inactive" } }, 20s ) );
 
-  const auto after_deactivate = list_controllers();
+  const auto after_deactivate = this->list_controllers();
   ASSERT_NE( after_deactivate, nullptr );
   const auto after_states = states_from_list( *after_deactivate );
   EXPECT_EQ( after_states.at( controller ), "inactive" );
 
-  ASSERT_TRUE( spin_while_executing( *executor_, [this, &controller]() {
-    return orchestrator_->activateControllers( { controller }, 10 );
+  ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &controller]() {
+    return this->orchestrator_->activateControllers( { controller }, 10 );
   } ) );
-  ASSERT_TRUE( wait_for_list_states( { { controller, "active" } }, 20s ) );
+  ASSERT_TRUE( this->wait_for_list_states( { { controller, "active" } }, 20s ) );
 }
 
-TEST_F( ControllerOrchestratorFixture, GetActiveControllerOfHardwareInterface )
+TYPED_TEST( ControllerOrchestratorTypedFixture, GetActiveControllerOfHardwareInterface )
 {
-  const auto flipper_controllers = spin_while_executing( *executor_, [this]() {
-    return orchestrator_->getActiveControllerOfHardwareInterface( "athena_flipper_interface", 10 );
+  bool is_multiple_chained_config =
+      ( std::string( TypeParam::ConfigType::name() ) == "MultipleChained" );
+  const auto flipper_controllers = spin_while_executing( *this->executor_, [this]() {
+    return this->orchestrator_->getActiveControllerOfHardwareInterface( "athena_flipper_interface",
+                                                                        10 );
   } );
   // at startup, there should be a controller chain of two controllers active on the flipper interface
   EXPECT_NE( std::find( flipper_controllers.begin(), flipper_controllers.end(),
@@ -546,10 +646,11 @@ TEST_F( ControllerOrchestratorFixture, GetActiveControllerOfHardwareInterface )
       std::find( flipper_controllers.begin(), flipper_controllers.end(), "vel_to_pos_controller" ),
       flipper_controllers.end() );
   // make sure there are no false positives
-  EXPECT_EQ( flipper_controllers.size(), 2u );
+  int flp_ctrls = is_multiple_chained_config ? 3 : 2;
+  EXPECT_EQ( flipper_controllers.size(), flp_ctrls );
 
-  const auto arm_controllers = spin_while_executing( *executor_, [this]() {
-    return orchestrator_->getActiveControllerOfHardwareInterface( "athena_arm_interface", 10 );
+  const auto arm_controllers = spin_while_executing( *this->executor_, [this]() {
+    return this->orchestrator_->getActiveControllerOfHardwareInterface( "athena_arm_interface", 10 );
   } );
   // at startup, there should be two controllers active on the arm interface (not a chain)
   EXPECT_NE( std::find( arm_controllers.begin(), arm_controllers.end(), "arm_trajectory_controller" ),
@@ -557,37 +658,46 @@ TEST_F( ControllerOrchestratorFixture, GetActiveControllerOfHardwareInterface )
   EXPECT_NE(
       std::find( arm_controllers.begin(), arm_controllers.end(), "gripper_trajectory_controller" ),
       arm_controllers.end() );
-  EXPECT_EQ( arm_controllers.size(), 2u );
+  if ( is_multiple_chained_config ) {
+    EXPECT_NE( std::find( arm_controllers.begin(), arm_controllers.end(),
+                          "arm_safety_position_controller" ),
+               arm_controllers.end() );
+  }
+  int arm_ctrls = is_multiple_chained_config ? 3 : 2;
+  EXPECT_EQ( arm_controllers.size(), arm_ctrls );
 
-  const auto unknown_controllers = spin_while_executing( *executor_, [this]() {
-    return orchestrator_->getActiveControllerOfHardwareInterface( "unknown_interface", 10 );
+  const auto unknown_controllers = spin_while_executing( *this->executor_, [this]() {
+    return this->orchestrator_->getActiveControllerOfHardwareInterface( "unknown_interface", 10 );
   } );
   EXPECT_TRUE( unknown_controllers.empty() );
 }
 
-TEST_F( ControllerOrchestratorFixture, UnloadControllersOfJoint )
+TYPED_TEST( ControllerOrchestratorTypedFixture, UnloadControllersOfJoint )
 {
-
+  bool is_multiple_chained_config =
+      ( std::string( TypeParam::ConfigType::name() ) == "MultipleChained" );
   // case: unknown joint → no-op
-  ASSERT_TRUE( spin_while_executing( *executor_, [this]() {
-    return orchestrator_->unloadControllersOfJoint( "unknown_joint", 10 );
+  ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
+    return this->orchestrator_->unloadControllersOfJoint( "unknown_joint", 10 );
   } ) );
   // case: joint with active controller → deactivate controller
-  ASSERT_TRUE( spin_while_executing( *executor_, [this]() {
-    return orchestrator_->unloadControllersOfJoint( "gripper_servo_joint", 10 );
+  ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
+    return this->orchestrator_->unloadControllersOfJoint( "gripper_servo_joint", 10 );
   } ) );
-  ASSERT_TRUE( wait_for_list_states( { { "gripper_trajectory_controller", "inactive" } }, 20s ) );
+  ASSERT_TRUE(
+      this->wait_for_list_states( { { "gripper_trajectory_controller", "inactive" } }, 20s ) );
   // case: controller chain → deactivate all controllers in chain
   // get number of currently active controllers in general
-  const int active_before = get_number_of_active_controllers();
+  const int active_before = this->get_number_of_active_controllers();
   ASSERT_GT( active_before, 0 );
-  ASSERT_TRUE( spin_while_executing( *executor_, [this]() {
-    return orchestrator_->unloadControllersOfJoint( "flipper_fl_joint", 10 );
+  ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
+    return this->orchestrator_->unloadControllersOfJoint( "flipper_fl_joint", 10 );
   } ) );
-  ASSERT_TRUE( wait_for_list_states(
+  ASSERT_TRUE( this->wait_for_list_states(
       { { "flipper_velocity_controller", "inactive" }, { "vel_to_pos_controller", "inactive" } },
       20s ) );
-  const int active_after = get_number_of_active_controllers();
+  const int active_after = this->get_number_of_active_controllers();
+  int flipper_ctrls = is_multiple_chained_config ? 3 : 2;
   EXPECT_EQ( active_before - active_after,
-             2 ); // two controllers should have been deactivated, not more
+             flipper_ctrls ); // two controllers should have been deactivated, not more
 }
