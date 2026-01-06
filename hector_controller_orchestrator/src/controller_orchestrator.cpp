@@ -5,8 +5,10 @@
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
+#include <functional>
 #include <lifecycle_msgs/msg/state.hpp>
 #include <memory>
+#include <queue>
 #include <rclcpp/rclcpp.hpp>
 #include <unordered_map>
 #include <unordered_set>
@@ -57,13 +59,18 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
                                                 const std::string &controller_manager_name )
     : node_( node ), controller_manager_name_( controller_manager_name )
 {
+  callback_group_ = node_->create_callback_group( rclcpp::CallbackGroupType::Reentrant );
+
   list_controllers_client_ = node_->create_client<ListControllers>(
-      controller_manager_name_ + "/list_controllers", rclcpp::ServicesQoS() );
+      controller_manager_name_ + "/list_controllers", rclcpp::ServicesQoS(), callback_group_ );
   switch_controller_client_ = node_->create_client<SwitchController>(
-      controller_manager_name_ + "/switch_controller", rclcpp::ServicesQoS() );
+      controller_manager_name_ + "/switch_controller", rclcpp::ServicesQoS(), callback_group_ );
   list_hardware_components_client_ =
       node_->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
-          controller_manager_name_ + "/list_hardware_components", rclcpp::ServicesQoS() );
+          controller_manager_name_ + "/list_hardware_components", rclcpp::ServicesQoS(),
+          callback_group_ );
+  rclcpp::SubscriptionOptions subscription_options;
+  subscription_options.callback_group = callback_group_;
   activity_subscription_ =
       node_->create_subscription<controller_manager_msgs::msg::ControllerManagerActivity>(
           controller_manager_name_ + "/activity", rclcpp::QoS( 10 ),
@@ -76,7 +83,8 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
             for ( const auto &controller : msg->controllers ) {
               controller_states_[controller.name] = lifecycleStateLabel( controller.state );
             }
-          } );
+          },
+          subscription_options );
 }
 
 void ControllerOrchestrator::smartSwitchControllerAsync(
@@ -692,20 +700,40 @@ bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_
   }
 
   auto list_resp = list_future.get();
+  if ( !list_resp ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] list_controllers service returned null response" );
+    return false;
+  }
+
+  std::unordered_map<std::string, std::vector<std::string>> chain_connections;
+  std::unordered_map<std::string, std::vector<std::string>> reverse_connections;
+  std::unordered_map<std::string, bool> controller_active;
   std::vector<std::string> controllers_to_deactivate;
+
+  auto controller_claims_joint = [&joint_name]( const auto &ctrl ) {
+    for ( const auto &claimed_if : ctrl.claimed_interfaces ) {
+      const auto sep_pos = claimed_if.find( '/' );
+      if ( sep_pos != std::string::npos ) {
+        if ( claimed_if.substr( 0, sep_pos ) == joint_name ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
 
   // Step 2: Iterate through active controllers and check if they claim the joint
   for ( const auto &ctrl : list_resp->controller ) {
+    for ( const auto &chain : ctrl.chain_connections ) {
+      chain_connections[ctrl.name].push_back( chain.name );
+      reverse_connections[chain.name].push_back( ctrl.name );
+    }
+    controller_active[ctrl.name] = ( ctrl.state == "active" );
+
     if ( ctrl.state == "active" ) {
-      for ( const auto &claimed_if : ctrl.claimed_interfaces ) {
-        const auto sep_pos = claimed_if.find( '/' );
-        if ( sep_pos != std::string::npos ) {
-          std::string claimed_joint = claimed_if.substr( 0, sep_pos );
-          if ( claimed_joint == joint_name ) {
-            controllers_to_deactivate.push_back( ctrl.name );
-            break; // No need to check more interfaces for this controller
-          }
-        }
+      if ( controller_claims_joint( ctrl ) ) {
+        controllers_to_deactivate.push_back( ctrl.name );
       }
     }
   }
@@ -718,8 +746,114 @@ bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_
     return true;
   }
 
-  // Step 4: Deactivate the identified controllers
-  return deactivateControllers( controllers_to_deactivate, timeout_s );
+  // Step 4: Collect all connected chain controllers and order by chain precedence.
+  std::unordered_set<std::string> visited;
+  std::vector<std::string> queue;
+  queue.reserve( controllers_to_deactivate.size() );
+  for ( const auto &name : controllers_to_deactivate ) {
+    if ( visited.insert( name ).second ) {
+      queue.push_back( name );
+    }
+  }
+
+  for ( size_t i = 0; i < queue.size(); ++i ) {
+    const std::string name = queue[i];
+    auto forward_it = chain_connections.find( name );
+    if ( forward_it != chain_connections.end() ) {
+      for ( const auto &neighbor : forward_it->second ) {
+        if ( visited.insert( neighbor ).second ) {
+          queue.push_back( neighbor );
+        }
+      }
+    }
+    auto reverse_it = reverse_connections.find( name );
+    if ( reverse_it != reverse_connections.end() ) {
+      for ( const auto &neighbor : reverse_it->second ) {
+        if ( visited.insert( neighbor ).second ) {
+          queue.push_back( neighbor );
+        }
+      }
+    }
+  }
+
+  std::unordered_set<std::string> active_chain;
+  for ( const auto &name : visited ) {
+    auto active_it = controller_active.find( name );
+    if ( active_it != controller_active.end() && active_it->second ) {
+      active_chain.insert( name );
+    }
+  }
+
+  if ( active_chain.empty() ) {
+    RCLCPP_INFO( node_->get_logger(),
+                 "[ControllerOrchestrator] No active controllers found in chain for joint '%s'",
+                 joint_name.c_str() );
+    return true;
+  }
+
+  std::unordered_map<std::string, size_t> indegree;
+  indegree.reserve( active_chain.size() );
+  for ( const auto &name : active_chain ) { indegree[name] = 0; }
+
+  for ( const auto &pair : chain_connections ) {
+    const auto &src = pair.first;
+    if ( active_chain.count( src ) == 0U ) {
+      continue;
+    }
+    for ( const auto &dst : pair.second ) {
+      if ( active_chain.count( dst ) == 0U ) {
+        continue;
+      }
+      ++indegree[dst];
+    }
+  }
+
+  std::priority_queue<std::string, std::vector<std::string>, std::greater<std::string>> ready;
+  for ( const auto &pair : indegree ) {
+    if ( pair.second == 0U ) {
+      ready.push( pair.first );
+    }
+  }
+
+  std::vector<std::string> ordered_controllers;
+  ordered_controllers.reserve( active_chain.size() );
+  while ( !ready.empty() ) {
+    const auto name = ready.top();
+    ready.pop();
+    ordered_controllers.push_back( name );
+    auto forward_it = chain_connections.find( name );
+    if ( forward_it != chain_connections.end() ) {
+      for ( const auto &neighbor : forward_it->second ) {
+        if ( active_chain.count( neighbor ) == 0U ) {
+          continue;
+        }
+        auto indeg_it = indegree.find( neighbor );
+        if ( indeg_it != indegree.end() && indeg_it->second > 0U ) {
+          --indeg_it->second;
+          if ( indeg_it->second == 0U ) {
+            ready.push( neighbor );
+          }
+        }
+      }
+    }
+  }
+
+  if ( ordered_controllers.size() != active_chain.size() ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] Unable to compute chain order for joint '%s'",
+                  joint_name.c_str() );
+    return false;
+  }
+
+  // Step 5: Deactivate controllers from top to joint.
+  for ( const auto &name : ordered_controllers ) {
+    if ( !deactivateControllers( { name }, timeout_s ) ) {
+      RCLCPP_ERROR( node_->get_logger(),
+                    "[ControllerOrchestrator] Failed to deactivate controller '%s'", name.c_str() );
+      return false;
+    }
+  }
+  return true;
 }
 
 } // namespace controller_orchestrator

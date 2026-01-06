@@ -3,12 +3,14 @@
 #include <controller_manager/controller_manager.hpp>
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
+#include <hardware_interface/introspection.hpp>
 #include <hector_controller_spawner/hector_controller_spawner.hpp>
 #include <hector_testing_utils/hector_testing_utils.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <realtime_tools/realtime_helpers.hpp>
 
+#include "controller_orchestrator_test_helpers.hpp"
 #include <controller_orchestrator/controller_orchestrator.hpp>
 
 #include <algorithm>
@@ -17,8 +19,6 @@
 #include <cmath>
 #include <cstring>
 #include <errno.h>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -27,6 +27,11 @@
 
 using controller_manager_msgs::msg::ControllerManagerActivity;
 using controller_manager_msgs::srv::ListControllers;
+using controller_orchestrator_test::compute_expected_deactivation;
+using controller_orchestrator_test::load_file;
+using controller_orchestrator_test::spin_while_executing;
+using controller_orchestrator_test::states_from_activity;
+using controller_orchestrator_test::states_from_list;
 using hector_testing_utils::HectorTestFixture;
 
 using namespace std::chrono_literals;
@@ -36,132 +41,9 @@ namespace
 
 constexpr int kSchedPriority = 50;
 
-std::string load_file( const std::string &path )
-{
-  std::ifstream stream( path );
-  std::ostringstream buffer;
-  buffer << stream.rdbuf();
-  return buffer.str();
-}
-
-std::string lifecycle_state_label( const lifecycle_msgs::msg::State &state )
-{
-  if ( !state.label.empty() ) {
-    return state.label;
-  }
-  switch ( state.id ) {
-  case lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE:
-    return "active";
-  case lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE:
-    return "inactive";
-  case lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED:
-    return "unconfigured";
-  case lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED:
-    return "finalized";
-  default:
-    return "unknown";
-  }
-}
-
-std::unordered_map<std::string, std::string> states_from_activity( const ControllerManagerActivity &msg )
-{
-  std::unordered_map<std::string, std::string> states;
-  states.reserve( msg.controllers.size() );
-  for ( const auto &controller : msg.controllers ) {
-    states[controller.name] = lifecycle_state_label( controller.state );
-  }
-  return states;
-}
-
-std::unordered_map<std::string, std::string> states_from_list( const ListControllers::Response &resp )
-{
-  std::unordered_map<std::string, std::string> states;
-  states.reserve( resp.controller.size() );
-  for ( const auto &controller : resp.controller ) { states[controller.name] = controller.state; }
-  return states;
-}
-
-bool overlaps( const std::vector<std::string> &left, const std::unordered_set<std::string> &right )
-{
-  for ( const auto &value : left ) {
-    if ( right.count( value ) != 0U ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-std::unordered_set<std::string>
-compute_expected_deactivation( const ListControllers::Response &resp,
-                               const std::vector<std::string> &requested )
-{
-  std::unordered_map<std::string, std::vector<std::string>> controller_resources;
-  std::unordered_map<std::string, std::vector<std::string>> chain_connections;
-  std::vector<std::string> active_controllers;
-
-  controller_resources.reserve( resp.controller.size() );
-  chain_connections.reserve( resp.controller.size() );
-
-  for ( const auto &ctrl : resp.controller ) {
-    controller_resources[ctrl.name] = std::vector<std::string>(
-        ctrl.required_command_interfaces.begin(), ctrl.required_command_interfaces.end() );
-    if ( ctrl.state == "active" ) {
-      active_controllers.push_back( ctrl.name );
-    }
-    for ( const auto &chain : ctrl.chain_connections ) {
-      chain_connections[ctrl.name].push_back( chain.name );
-    }
-  }
-
-  std::vector<std::string> to_activate = requested;
-  bool added = true;
-  while ( added ) {
-    added = false;
-    for ( size_t i = 0; i < to_activate.size(); ++i ) {
-      const auto &name = to_activate[i];
-      for ( const auto &linked : chain_connections[name] ) {
-        if ( std::find( to_activate.begin(), to_activate.end(), linked ) == to_activate.end() ) {
-          to_activate.push_back( linked );
-          added = true;
-        }
-      }
-    }
-  }
-
-  std::unordered_set<std::string> needed_resources;
-  for ( const auto &name : to_activate ) {
-    const auto &resources = controller_resources[name];
-    needed_resources.insert( resources.begin(), resources.end() );
-  }
-
-  std::unordered_set<std::string> to_deactivate;
-  for ( const auto &active_name : active_controllers ) {
-    if ( overlaps( controller_resources[active_name], needed_resources ) ) {
-      to_deactivate.insert( active_name );
-    }
-  }
-
-  added = true;
-  while ( added ) {
-    added = false;
-    for ( const auto &active_name : active_controllers ) {
-      for ( const auto &linked : chain_connections[active_name] ) {
-        if ( to_deactivate.count( linked ) != 0U && to_deactivate.count( active_name ) == 0U ) {
-          to_deactivate.insert( active_name );
-          added = true;
-        }
-      }
-    }
-  }
-
-  for ( const auto &name : to_activate ) { to_deactivate.erase( name ); }
-
-  return to_deactivate;
-}
-
 } // namespace
 
-class ControllerOrchestratorFixture : public HectorTestFixture
+class ControllerOrchestratorFixtureBase : public HectorTestFixture
 {
 protected:
   void SetUp() override
@@ -180,7 +62,16 @@ protected:
     cm_options.arguments( yaml_options.arguments() );
     cm_options.automatically_declare_parameters_from_overrides( true );
 
-    cm_executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
+    // Initialize pal_statistics registries before ControllerManager registers interfaces.
+    INITIALIZE_ROS2_CONTROL_INTROSPECTION_REGISTRY( tester_node_,
+                                                    hardware_interface::DEFAULT_INTROSPECTION_TOPIC,
+                                                    hardware_interface::DEFAULT_REGISTRY_KEY );
+    INITIALIZE_ROS2_CONTROL_INTROSPECTION_REGISTRY( tester_node_,
+                                                    hardware_interface::CM_STATISTICS_TOPIC,
+                                                    hardware_interface::CM_STATISTICS_KEY );
+
+    cm_executor_ = create_cm_executor();
+    ASSERT_NE( cm_executor_, nullptr );
     controller_manager_ = std::make_shared<controller_manager::ControllerManager>(
         cm_executor_, urdf, false, "controller_manager", "", cm_options );
 
@@ -227,6 +118,8 @@ protected:
 
     ASSERT_TRUE( start_spawner_node() );
 
+    // wait until the multi-spawner has loaded and started the controllers
+    // if this fails, likely the spawner node failed to not the orchestrator
     ASSERT_TRUE( wait_for_activity( expected_initial_states(), 30s ) );
   }
 
@@ -270,6 +163,56 @@ protected:
     options.response_timeout = 10s;
     return hector_testing_utils::call_service<ListControllers>( list_client_->get(), request,
                                                                 *executor_, options );
+  }
+
+  bool wait_for_list_states( const std::unordered_map<std::string, std::string> &expected,
+                             std::chrono::nanoseconds timeout )
+  {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while ( std::chrono::steady_clock::now() < deadline ) {
+      const auto resp = list_controllers();
+      if ( resp != nullptr ) {
+        const auto states = states_from_list( *resp );
+        bool matches = true;
+        for ( const auto &pair : expected ) {
+          auto it = states.find( pair.first );
+          if ( it == states.end() || it->second != pair.second ) {
+            matches = false;
+            break;
+          }
+        }
+        if ( matches ) {
+          return true;
+        }
+      }
+      executor_->spin_some();
+      std::this_thread::sleep_for( 50ms );
+    }
+    // print final states for debugging
+    const auto resp = list_controllers();
+    if ( resp != nullptr ) {
+      const auto states = states_from_list( *resp );
+      RCLCPP_INFO( tester_node_->get_logger(), "Final controller states:" );
+      for ( const auto &pair : states ) {
+        RCLCPP_INFO( tester_node_->get_logger(), "  %s: %s", pair.first.c_str(), pair.second.c_str() );
+      }
+    }
+    return false;
+  }
+
+  int get_number_of_active_controllers()
+  {
+    const auto resp = list_controllers();
+    if ( resp == nullptr ) {
+      return 0;
+    }
+    int count = 0;
+    for ( const auto &ctrl : resp->controller ) {
+      if ( ctrl.state == "active" ) {
+        ++count;
+      }
+    }
+    return count;
   }
 
   void start_update_loop( bool use_sim_time, bool manage_overruns, int thread_priority )
@@ -393,7 +336,7 @@ protected:
   std::string urdf_path_;
 
   std::atomic<bool> cm_running_{ false };
-  std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> cm_executor_;
+  std::shared_ptr<rclcpp::Executor> cm_executor_;
   std::shared_ptr<controller_manager::ControllerManager> controller_manager_;
   std::thread cm_spin_thread_;
   std::thread cm_update_thread_;
@@ -402,6 +345,26 @@ protected:
   std::shared_ptr<hector_controller_spawner::MultiSpawner> spawner_node_;
   std::shared_ptr<hector_testing_utils::TestSubscription<ControllerManagerActivity>> activity_sub_;
   std::shared_ptr<hector_testing_utils::TestClient<ListControllers>> list_client_;
+
+  virtual std::shared_ptr<rclcpp::Executor> create_cm_executor() = 0;
+};
+
+class ControllerOrchestratorFixture : public ControllerOrchestratorFixtureBase
+{
+protected:
+  std::shared_ptr<rclcpp::Executor> create_cm_executor() override
+  {
+    return std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
+  }
+};
+
+class ControllerOrchestratorSingleThreadedFixture : public ControllerOrchestratorFixtureBase
+{
+protected:
+  std::shared_ptr<rclcpp::Executor> create_cm_executor() override
+  {
+    return std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+  }
 };
 
 TEST_F( ControllerOrchestratorFixture, SmartSwitchSync )
@@ -446,6 +409,32 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchSync )
       EXPECT_EQ( after_states.at( pair.first ), "active" );
     }
   }
+}
+
+TEST_F( ControllerOrchestratorSingleThreadedFixture, SmartSwitchAsyncSingleThreadedExecutor )
+{
+  const std::vector<std::string> requested = { "flipper_trajectory_controller" };
+
+  activity_sub_->reset();
+  std::atomic<bool> callback_done{ false };
+  bool async_success = false;
+  std::string async_message;
+
+  std::thread async_thread( [this, &requested, &callback_done, &async_success, &async_message]() {
+    orchestrator_->smartSwitchControllerAsync(
+        requested,
+        [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
+          async_success = success;
+          async_message = message;
+          callback_done = true;
+        },
+        true );
+  } );
+
+  ASSERT_TRUE( wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
+  ASSERT_TRUE( executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
+  async_thread.join();
+  ASSERT_TRUE( async_success ) << async_message;
 }
 
 TEST_F( ControllerOrchestratorFixture, SmartSwitchAsync )
@@ -511,4 +500,94 @@ TEST_F( ControllerOrchestratorFixture, SmartSwitchAsync )
       EXPECT_EQ( after_states.at( pair.first ), "active" );
     }
   }
+}
+
+TEST_F( ControllerOrchestratorFixture, RefreshControllerStates )
+{
+  ASSERT_TRUE( spin_while_executing(
+      *executor_, [this]() { return orchestrator_->refreshControllerStates( 10 ); } ) );
+}
+
+TEST_F( ControllerOrchestratorFixture, ActivateDeactivateControllers )
+{
+  const std::string controller = "gripper_trajectory_controller";
+
+  const auto before_resp = list_controllers();
+  ASSERT_NE( before_resp, nullptr );
+  const auto before_states = states_from_list( *before_resp );
+  ASSERT_EQ( before_states.at( controller ), "active" );
+
+  ASSERT_TRUE( spin_while_executing( *executor_, [this, &controller]() {
+    return orchestrator_->deactivateControllers( { controller }, 10 );
+  } ) );
+  ASSERT_TRUE( wait_for_list_states( { { controller, "inactive" } }, 20s ) );
+
+  const auto after_deactivate = list_controllers();
+  ASSERT_NE( after_deactivate, nullptr );
+  const auto after_states = states_from_list( *after_deactivate );
+  EXPECT_EQ( after_states.at( controller ), "inactive" );
+
+  ASSERT_TRUE( spin_while_executing( *executor_, [this, &controller]() {
+    return orchestrator_->activateControllers( { controller }, 10 );
+  } ) );
+  ASSERT_TRUE( wait_for_list_states( { { controller, "active" } }, 20s ) );
+}
+
+TEST_F( ControllerOrchestratorFixture, GetActiveControllerOfHardwareInterface )
+{
+  const auto flipper_controllers = spin_while_executing( *executor_, [this]() {
+    return orchestrator_->getActiveControllerOfHardwareInterface( "athena_flipper_interface", 10 );
+  } );
+  // at startup, there should be a controller chain of two controllers active on the flipper interface
+  EXPECT_NE( std::find( flipper_controllers.begin(), flipper_controllers.end(),
+                        "flipper_velocity_controller" ),
+             flipper_controllers.end() );
+  EXPECT_NE(
+      std::find( flipper_controllers.begin(), flipper_controllers.end(), "vel_to_pos_controller" ),
+      flipper_controllers.end() );
+  // make sure there are no false positives
+  EXPECT_EQ( flipper_controllers.size(), 2u );
+
+  const auto arm_controllers = spin_while_executing( *executor_, [this]() {
+    return orchestrator_->getActiveControllerOfHardwareInterface( "athena_arm_interface", 10 );
+  } );
+  // at startup, there should be two controllers active on the arm interface (not a chain)
+  EXPECT_NE( std::find( arm_controllers.begin(), arm_controllers.end(), "arm_trajectory_controller" ),
+             arm_controllers.end() );
+  EXPECT_NE(
+      std::find( arm_controllers.begin(), arm_controllers.end(), "gripper_trajectory_controller" ),
+      arm_controllers.end() );
+  EXPECT_EQ( arm_controllers.size(), 2u );
+
+  const auto unknown_controllers = spin_while_executing( *executor_, [this]() {
+    return orchestrator_->getActiveControllerOfHardwareInterface( "unknown_interface", 10 );
+  } );
+  EXPECT_TRUE( unknown_controllers.empty() );
+}
+
+TEST_F( ControllerOrchestratorFixture, UnloadControllersOfJoint )
+{
+
+  // case: unknown joint → no-op
+  ASSERT_TRUE( spin_while_executing( *executor_, [this]() {
+    return orchestrator_->unloadControllersOfJoint( "unknown_joint", 10 );
+  } ) );
+  // case: joint with active controller → deactivate controller
+  ASSERT_TRUE( spin_while_executing( *executor_, [this]() {
+    return orchestrator_->unloadControllersOfJoint( "gripper_servo_joint", 10 );
+  } ) );
+  ASSERT_TRUE( wait_for_list_states( { { "gripper_trajectory_controller", "inactive" } }, 20s ) );
+  // case: controller chain → deactivate all controllers in chain
+  // get number of currently active controllers in general
+  const int active_before = get_number_of_active_controllers();
+  ASSERT_GT( active_before, 0 );
+  ASSERT_TRUE( spin_while_executing( *executor_, [this]() {
+    return orchestrator_->unloadControllersOfJoint( "flipper_fl_joint", 10 );
+  } ) );
+  ASSERT_TRUE( wait_for_list_states(
+      { { "flipper_velocity_controller", "inactive" }, { "vel_to_pos_controller", "inactive" } },
+      20s ) );
+  const int active_after = get_number_of_active_controllers();
+  EXPECT_EQ( active_before - active_after,
+             2 ); // two controllers should have been deactivated, not more
 }

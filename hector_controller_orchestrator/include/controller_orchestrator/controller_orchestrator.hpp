@@ -80,6 +80,7 @@ private:
       const std::function<void( bool success, const std::string &message )> &callback ) const;
   rclcpp::Node::SharedPtr node_;
   std::string controller_manager_name_;
+  rclcpp::CallbackGroup::SharedPtr callback_group_;
   rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr list_controllers_client_;
   rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_controller_client_;
   rclcpp::Client<controller_manager_msgs::srv::ListHardwareComponents>::SharedPtr
