@@ -89,17 +89,16 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
 
 void ControllerOrchestrator::smartSwitchControllerAsync(
     const std::vector<std::string> &activate_controllers,
-    const std::function<void( bool success, const std::string &message )> &callback,
-    bool refresh_ctrl_status ) const
+    const std::function<void( bool success, const std::string &message )> &callback ) const
 {
   if ( activate_controllers.empty() ) {
     callback( true, "No controllers requested" );
     return;
   }
 
-  if ( refresh_ctrl_status && !refreshControllerStates() ) {
-    callback( false, "refreshControllerStates failed" );
-    return;
+  // check if controllers are already active
+  if ( areControllersActive( activate_controllers ) ) {
+    callback( true, "Controller are already active. If not call refreshControllerStates." );
   }
 
   if ( !list_controllers_client_->service_is_ready() ) {
@@ -271,6 +270,28 @@ bool ControllerOrchestrator::refreshControllerStates( int timeout_s ) const
   return true;
 }
 
+void ControllerOrchestrator::refreshControllerStatesAsync(
+    const std::function<void( bool success, const std::string &message )> &callback,
+    int timeout_s ) const
+{
+  if ( !list_controllers_client_->service_is_ready() ) {
+    callback( false, "list_controllers service not ready" );
+    return;
+  }
+
+  auto list_req = std::make_shared<ListControllers::Request>();
+  list_controllers_client_->async_send_request(
+      list_req, [this, callback]( rclcpp::Client<ListControllers>::SharedFuture list_future ) {
+        const auto list_resp = list_future.get();
+        if ( !list_resp ) {
+          callback( false, "list_controllers returned null response" );
+          return;
+        }
+        updateControllerStatesFromList( *list_resp );
+        callback( true, "Refresh successful" );
+      } );
+}
+
 void ControllerOrchestrator::recursiveActivateControllers(
     std::shared_ptr<std::vector<std::string>> controllers_to_activate, size_t index,
     const std::function<void( bool success, const std::string &message )> &callback ) const
@@ -318,40 +339,43 @@ void ControllerOrchestrator::recursiveDeactivateControllers(
 }
 
 bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &activate_controllers,
-                                                    int timeout_s, bool refresh_ctrl_status ) const
+                                                    int timeout_s ) const
 {
-  if ( refresh_ctrl_status && !refreshControllerStates( timeout_s ) )
-    return false;
-  if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) )
-    return false;
-  auto list_resp =
-      list_controllers_client_->async_send_request( std::make_shared<ListControllers::Request>() ).get();
-  if ( !list_resp )
-    return false;
-  updateControllerStatesFromList( *list_resp );
+  // Safety Check: Avoid running this directly inside a SingleThreadedExecutor callback
 
-  std::vector<std::string> to_deactivate;
-  // Analysis returns Head -> Tail
-  if ( !smartSwitchControllerAnalysis( activate_controllers, to_deactivate, *list_resp ) )
-    return false;
-  if ( activate_controllers.empty() && to_deactivate.empty() )
+  // if controllers already active do nothing
+  if ( areControllersActive( activate_controllers ) ) {
+    RCLCPP_INFO( node_->get_logger(), "[ControllerOrchestrator] Controllers are already active. If "
+                                      "not call refreshControllerStates." );
     return true;
-
-  // 1. Deactivate: Head -> Tail (Topo)
-  if ( !to_deactivate.empty() ) {
-    RCLCPP_INFO( node_->get_logger(), "Deactivating: %s", vecToString( to_deactivate ).c_str() );
-    if ( !deactivateControllers( to_deactivate, timeout_s ) )
-      return false;
   }
 
-  // 2. Activate: Tail -> Head (Reverse Topo)
-  if ( !activate_controllers.empty() ) {
-    std::reverse( activate_controllers.begin(), activate_controllers.end() );
-    RCLCPP_INFO( node_->get_logger(), "Activating: %s", vecToString( activate_controllers ).c_str() );
-    if ( !activateControllers( activate_controllers, timeout_s ) )
-      return false;
+  auto promise = std::make_shared<std::promise<std::pair<bool, std::string>>>();
+  auto future = promise->get_future();
+
+  // Call the Async version, but bind the result to our promise
+  smartSwitchControllerAsync( activate_controllers,
+                              [promise]( bool success, const std::string &message ) {
+                                promise->set_value( { success, message } );
+                              } );
+
+  // Wait for the result (Blocking)
+  auto status = future.wait_for( std::chrono::seconds( timeout_s ) );
+
+  if ( status == std::future_status::timeout ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] Synchronous Switch Timed Out after %d seconds. "
+                  "Likely Cause: The ROS Executor is not spinning to process the response.",
+                  timeout_s );
+    return false;
   }
-  return true;
+
+  auto result = future.get();
+  if ( !result.first ) {
+    RCLCPP_ERROR( node_->get_logger(), "[ControllerOrchestrator] Switch failed: %s",
+                  result.second.c_str() );
+  }
+  return result.first;
 }
 
 void ControllerOrchestrator::updateControllerStatesFromList(

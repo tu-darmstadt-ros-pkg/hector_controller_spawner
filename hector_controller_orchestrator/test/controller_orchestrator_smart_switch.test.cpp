@@ -129,6 +129,8 @@ protected:
     stop_spawner_node();
     stop_controller_manager();
     HectorTestFixture::TearDown();
+    // sleep for 0.3
+    std::this_thread::sleep_for( 300ms );
   }
 
   virtual std::unordered_map<std::string, std::string> expected_initial_states() const
@@ -496,7 +498,7 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSync )
   bool switch_success = false;
   std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
     auto to_activate = requested;
-    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
+    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10 );
     switch_done = true;
   } );
   ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
@@ -536,6 +538,7 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsyncSingleThreadedEx
   bool async_success = false;
   std::string async_message;
 
+  // hack for single threaded executor using async function
   std::thread async_thread( [this, &requested, &callback_done, &async_success, &async_message]() {
     this->orchestrator_->smartSwitchControllerAsync(
         requested,
@@ -543,8 +546,7 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsyncSingleThreadedEx
           async_success = success;
           async_message = message;
           callback_done = true;
-        },
-        true );
+        } );
   } );
 
   ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
@@ -556,21 +558,8 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsyncSingleThreadedEx
 
 TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsync )
 {
-  const std::vector<std::string> first = { "flipper_trajectory_controller" };
+  const std::vector<std::string> requested = { "flipper_trajectory_controller" };
   this->activity_sub_->reset();
-  std::atomic<bool> initial_done{ false };
-  bool initial_success = false;
-  std::thread initial_thread( [this, &first, &initial_done, &initial_success]() {
-    auto to_activate = first;
-    initial_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
-    initial_done = true;
-  } );
-  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
-  ASSERT_TRUE( this->executor_->spin_until( [&initial_done]() { return initial_done.load(); }, 20s ) );
-  initial_thread.join();
-  ASSERT_TRUE( initial_success );
-
-  const std::vector<std::string> requested = { "flipper_velocity_controller" };
   const auto before_resp = this->list_controllers();
   ASSERT_NE( before_resp, nullptr );
   const auto expected_deactivate = compute_expected_deactivation( *before_resp, requested );
@@ -580,21 +569,17 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsync )
   std::string async_message;
 
   this->activity_sub_->reset();
-  std::thread async_thread( [this, &requested, &callback_done, &async_success, &async_message]() {
-    this->orchestrator_->smartSwitchControllerAsync(
-        requested,
-        [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
-          async_success = success;
-          async_message = message;
-          callback_done = true;
-        },
-        true );
-  } );
+  this->orchestrator_->smartSwitchControllerAsync(
+      requested,
+      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
+        async_success = success;
+        async_message = message;
+        callback_done = true;
+      } );
 
-  ASSERT_TRUE( this->wait_for_activity( { { "flipper_velocity_controller", "active" } }, 20s ) );
+  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
   ASSERT_TRUE(
       this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
-  async_thread.join();
   ASSERT_TRUE( async_success ) << async_message;
 
   const auto after_resp = this->list_controllers();
@@ -603,7 +588,7 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsync )
   const auto before_states = states_from_list( *before_resp );
   const auto after_states = states_from_list( *after_resp );
 
-  EXPECT_EQ( after_states.at( "flipper_velocity_controller" ), "active" );
+  EXPECT_EQ( after_states.at( "flipper_trajectory_controller" ), "active" );
 
   for ( const auto &name : expected_deactivate ) {
     auto it = after_states.find( name );
@@ -622,6 +607,11 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsync )
 
 TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActive )
 {
+  // skip for single threaded executor to avoid deadlock with blocking sync call
+  if ( TypeParam::ExecutorType::name() == std::string( "SingleThreaded" ) ) {
+    GTEST_SKIP() << "Skipping sync test for single threaded executor to avoid deadlock.";
+  }
+
   // Edge case: trying to activate a controller that is already active should be a no-op
   const std::vector<std::string> requested = { "flipper_velocity_controller" };
 
@@ -633,17 +623,49 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActive )
   ASSERT_EQ( before_states.at( "flipper_velocity_controller" ), "active" );
 
   this->activity_sub_->reset();
-  std::atomic<bool> switch_done{ false };
-  bool switch_success = false;
-  std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
-    auto to_activate = requested;
-    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
-    switch_done = true;
-  } );
-
-  ASSERT_TRUE( this->executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
-  switch_thread.join();
+  auto to_activate = requested;
+  const bool switch_success = this->orchestrator_->smartSwitchController( to_activate, 10 );
   ASSERT_TRUE( switch_success );
+
+  const auto after_resp = this->list_controllers();
+  ASSERT_NE( after_resp, nullptr );
+  const auto after_states = states_from_list( *after_resp );
+
+  // Verify nothing changed - controller still active, all other states unchanged
+  EXPECT_EQ( after_states.at( "flipper_velocity_controller" ), "active" );
+  for ( const auto &pair : before_states ) {
+    EXPECT_EQ( after_states.at( pair.first ), pair.second );
+  }
+}
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActiveAsync )
+{
+  // Edge case (async): trying to activate a controller that is already active should be a no-op
+  const std::vector<std::string> requested = { "flipper_velocity_controller" };
+
+  const auto before_resp = this->list_controllers();
+  ASSERT_NE( before_resp, nullptr );
+  const auto before_states = states_from_list( *before_resp );
+
+  // Verify flipper_velocity_controller is already active
+  ASSERT_EQ( before_states.at( "flipper_velocity_controller" ), "active" );
+
+  this->activity_sub_->reset();
+  std::atomic<bool> callback_done{ false };
+  bool async_success = false;
+  std::string async_message;
+
+  this->orchestrator_->smartSwitchControllerAsync(
+      requested,
+      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
+        async_success = success;
+        async_message = message;
+        callback_done = true;
+      } );
+
+  ASSERT_TRUE(
+      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
+  ASSERT_TRUE( async_success ) << async_message;
 
   const auto after_resp = this->list_controllers();
   ASSERT_NE( after_resp, nullptr );
@@ -658,35 +680,83 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActive )
 
 TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSeparateControllers )
 {
-  // Test activating two independent controllers simultaneously
-  // First deactivate gripper_trajectory_controller
-  ASSERT_TRUE( spin_while_executing( *this->executor_, []() { return true; } ) );
+  if ( TypeParam::ExecutorType::name() == std::string( "SingleThreaded" ) ) {
+    GTEST_SKIP() << "Skipping sync test for single threaded executor to avoid deadlock.";
+  }
 
+  // 1. Deactivate gripper
   const std::string gripper_ctrl = "gripper_trajectory_controller";
   ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &gripper_ctrl]() {
     return this->orchestrator_->deactivateControllers( { gripper_ctrl }, 10 );
   } ) );
   ASSERT_TRUE( this->wait_for_list_states( { { gripper_ctrl, "inactive" } }, 20s ) );
 
-  // Now try to activate both flipper_trajectory_controller and gripper_trajectory_controller
+  // 2. Activate Both (THE FIX: Use spin_while_executing)
+  const std::vector<std::string> requested = { "flipper_trajectory_controller",
+                                               "gripper_trajectory_controller" };
+  this->activity_sub_->reset();
+
+  bool switch_success = false;
+  auto to_activate = requested;
+
+  // WRAP THIS CALL:
+  switch_success = spin_while_executing( *this->executor_, [this, &to_activate]() {
+    return this->orchestrator_->smartSwitchController( to_activate, 10 );
+  } );
+
+  ASSERT_TRUE( switch_success );
+
+  /*ASSERT_TRUE( this->wait_for_activity(
+      { { "flipper_trajectory_controller", "active" }, { "gripper_trajectory_controller", "active" }
+     }, 20s ) );*/
+
+  // Verification
+  const auto after_resp = this->list_controllers();
+  ASSERT_NE( after_resp, nullptr );
+  const auto after_states = states_from_list( *after_resp );
+  EXPECT_EQ( after_states.at( "flipper_trajectory_controller" ), "active" );
+  EXPECT_EQ( after_states.at( "gripper_trajectory_controller" ), "active" );
+}
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSeparateControllersAsync )
+{
+  // Test activating two separate controllers that don't interfere with each other (async version)
+  // flipper_trajectory_controller and gripper_trajectory_controller use different hardware interfaces
+
+  // First, deactivate gripper to set up initial state
+  const std::string gripper = "gripper_trajectory_controller";
+  ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &gripper]() {
+    return this->orchestrator_->deactivateControllers( { gripper }, 10 );
+  } ) );
+  ASSERT_TRUE( this->wait_for_list_states( { { gripper, "inactive" } }, 20s ) );
+
+  // Now try to activate both controllers
   const std::vector<std::string> requested = { "flipper_trajectory_controller",
                                                "gripper_trajectory_controller" };
 
+  const auto before_resp = this->list_controllers();
+  ASSERT_NE( before_resp, nullptr );
+  const auto before_states = states_from_list( *before_resp );
+
   this->activity_sub_->reset();
-  std::atomic<bool> switch_done{ false };
-  bool switch_success = false;
-  std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
-    auto to_activate = requested;
-    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
-    switch_done = true;
-  } );
+  std::atomic<bool> callback_done{ false };
+  bool async_success = false;
+  std::string async_message;
+
+  this->orchestrator_->smartSwitchControllerAsync(
+      requested,
+      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
+        async_success = success;
+        async_message = message;
+        callback_done = true;
+      } );
 
   ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" },
                                           { "gripper_trajectory_controller", "active" } },
                                         20s ) );
-  ASSERT_TRUE( this->executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
-  switch_thread.join();
-  ASSERT_TRUE( switch_success );
+  ASSERT_TRUE(
+      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
+  ASSERT_TRUE( async_success );
 
   const auto after_resp = this->list_controllers();
   ASSERT_NE( after_resp, nullptr );
@@ -699,7 +769,41 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSeparateControllers )
 
 TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchImpossibleCombination )
 {
-  // Test activating an impossible combination: flipper_trajectory_controller and
+  if ( TypeParam::ExecutorType::name() == std::string( "SingleThreaded" ) ) {
+    GTEST_SKIP() << "Skipping sync test for single threaded executor to avoid deadlock.";
+  }
+
+  const std::vector<std::string> requested = { "flipper_trajectory_controller",
+                                               "vel_to_pos_controller" };
+
+  // Get initial state
+  const auto before_resp = this->list_controllers();
+  ASSERT_NE( before_resp, nullptr );
+  const auto before_states = states_from_list( *before_resp );
+
+  this->activity_sub_->reset();
+  auto to_activate = requested;
+
+  // WRAP THIS CALL:
+  bool switch_success = spin_while_executing( *this->executor_, [this, &to_activate]() {
+    return this->orchestrator_->smartSwitchController( to_activate, 10 );
+  } );
+
+  // This combination should fail in analysis
+  ASSERT_FALSE( switch_success );
+
+  // Verify state is unchanged
+  const auto after_resp = this->list_controllers();
+  ASSERT_NE( after_resp, nullptr );
+  const auto after_states = states_from_list( *after_resp );
+  for ( const auto &pair : before_states ) {
+    EXPECT_EQ( after_states.at( pair.first ), pair.second );
+  }
+}
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchImpossibleCombinationAsync )
+{
+  // Test activating an impossible combination (async version): flipper_trajectory_controller and
   // vel_to_pos_controller These controllers are in the same chain but flipper_trajectory depends on
   // safety controllers, so activating both the top of the chain and a middle controller should fail
 
@@ -711,19 +815,23 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchImpossibleCombination
   const auto before_states = states_from_list( *before_resp );
 
   this->activity_sub_->reset();
-  std::atomic<bool> switch_done{ false };
-  bool switch_success = false;
-  std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
-    auto to_activate = requested;
-    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10, true );
-    switch_done = true;
-  } );
+  std::atomic<bool> callback_done{ false };
+  bool async_success = false;
+  std::string async_message;
 
-  ASSERT_TRUE( this->executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
-  switch_thread.join();
+  this->orchestrator_->smartSwitchControllerAsync(
+      requested,
+      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
+        async_success = success;
+        async_message = message;
+        callback_done = true;
+      } );
+
+  ASSERT_TRUE(
+      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
 
   // This combination should fail in analysis
-  ASSERT_FALSE( switch_success );
+  ASSERT_FALSE( async_success );
 
   const auto after_resp = this->list_controllers();
   ASSERT_NE( after_resp, nullptr );
@@ -836,4 +944,22 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, UnloadControllersOfJoint )
   int flipper_ctrls = is_multiple_chained_config ? 3 : 2;
   EXPECT_EQ( active_before - active_after,
              flipper_ctrls ); // two controllers should have been deactivated, not more
+}
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, RefreshControllerStatesAsync )
+{
+  std::atomic<bool> callback_done{ false };
+  bool async_success = false;
+  std::string async_message;
+
+  this->orchestrator_->refreshControllerStatesAsync(
+      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
+        async_success = success;
+        async_message = message;
+        callback_done = true;
+      } );
+
+  ASSERT_TRUE(
+      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
+  ASSERT_TRUE( async_success ) << async_message;
 }

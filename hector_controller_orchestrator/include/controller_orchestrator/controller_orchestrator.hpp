@@ -35,13 +35,12 @@ public:
    * of the controllers to be activated is already active.
    * @return
    */
-  bool smartSwitchController( std::vector<std::string> &activate_controllers, int timeout_s = 2,
-                              bool refresh_ctrl_status = false ) const;
+  bool smartSwitchController( std::vector<std::string> &activate_controllers,
+                              int timeout_s = 2 ) const;
 
   void smartSwitchControllerAsync(
       const std::vector<std::string> &activate_controllers,
-      const std::function<void( bool success, const std::string &message )> &callback,
-      bool refresh_ctrl_status = false ) const;
+      const std::function<void( bool success, const std::string &message )> &callback ) const;
 
   std::vector<std::string> getActiveControllerOfHardwareInterface( const std::string &hardware_interface,
                                                                    int timeout_s = 2 ) const;
@@ -63,6 +62,9 @@ public:
      &controllers_to_activate, int timeout_s = 2 );*/
   bool unloadControllersOfJoint( const std::string &joint_name, int timeout_s = 2 );
   bool refreshControllerStates( int timeout_s = 2 ) const;
+  void refreshControllerStatesAsync(
+      const std::function<void( bool success, const std::string &message )> &callback,
+      int timeout_s = 2 ) const;
 
 private:
   // ============================================================================
