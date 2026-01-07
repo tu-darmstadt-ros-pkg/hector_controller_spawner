@@ -43,6 +43,18 @@ constexpr int kSchedPriority = 50;
 
 } // namespace
 
+/**
+ * This tests fixture sets up a ControllerManager with a spawner node and a ControllerOrchestrator.
+ * The tests are executed four times with different configurations:
+ * - Different Controller Configurations:
+ *   - Normal: Basic controllers with chains of max length 2
+ *   - MultipleChained: Controllers with multiple chains and longer dependencies
+ * - Different Executor Types:
+ *   - SingleThreadedExecutor: All nodes run in a single thread (some tests are skipped in this mode)
+ *   - MultiThreadedExecutor: Nodes run in a multi-threaded executor
+ * - each test is executed with all combinations of the above settings
+ */
+
 class ControllerOrchestratorFixtureBase : public HectorTestFixture
 {
 protected:
