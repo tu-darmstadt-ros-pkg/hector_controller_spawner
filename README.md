@@ -1,12 +1,17 @@
-# Hector Controller Spawner – **Multispawner**
+# Hector Controller Tools
+![Lint](https://github.com/tu-darmstadt-ros-pkg/hector_controller_spawner/actions/workflows/lint_build_test.yaml/badge.svg)
+
+Toolkit containing:
+- **Hector Controller Spawner (Multispawner):** One-shot launcher that loads/activates hardware and controllers with chaining, retries, and optional e-stop gating.
+- **Hector Controller Orchestrator:** C++ helper library that performs dependency-aware, resource-safe controller switching. See [hector_controller_orchestrator/README.md](hector_controller_orchestrator/README.md).
+---
+## Hector Controller Spawner – **Multispawner**
 
 **ROS2 Hardware & Controller Launcher for `ros2_control`**
 
 **Multispawner** is a minimal ROS2 node that launches an entire `ros2_control` setup in a single coordinated pass.
 It robustly manages hardware interfaces and controllers, ensuring everything is loaded, activated (if required), and
 ready to go with minimal configuration.
-
----
 
 ## 🚀 Features
 
@@ -23,7 +28,6 @@ ready to go with minimal configuration.
 * **Single-node simplicity:** No need to spawn one spawner per controller - Multispawner handles everything.
 * **Robust retry logic:** Retries failed hardware/controller activations with configurable delays.
 
----
 
 ## 🔧 Key Parameters
 
@@ -41,7 +45,6 @@ ready to go with minimal configuration.
 
 📄 See [`athena.yaml`](config/athena.yaml) for a complete configuration example.
 
----
 
 ## 🧪 Example Usage
 
@@ -51,3 +54,15 @@ ros2 launch hector_controller_spawner hector_controller_spawner_launch.yml
 
 * Include **only once** in your launch setup.
 * No need for individual `spawner` calls per controller.
+
+
+---
+# Hector Controller Orchestrator
+C++ utility library that makes controller switching safe and predictable in `ros2_control` systems. It:
+- Resolves chained dependencies automatically (starts dependencies first, stops dependents first).
+- Detects resource conflicts and computes which controllers must deactivate before activating new ones.
+- Provides synchronous and asynchronous APIs; async variants are safe for single-threaded executors.
+- Caches controller state from `controller_manager/activity` to avoid repeated service calls.
+- Exposes helper utilities to query active controllers for a hardware interface or unload all controllers claiming a joint.
+
+Read the full guide and examples: [hector_controller_orchestrator/README.md](hector_controller_orchestrator/README.md)

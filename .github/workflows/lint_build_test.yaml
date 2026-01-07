@@ -64,6 +64,10 @@ jobs:
         path: src/hector_ros2_utils
     - uses: actions/checkout@v4
       with:
+        repository: Joschi3/hector_testing_utils
+        path: src/hector_testing_utils
+    - uses: actions/checkout@v4
+      with:
         path: src/repo
     - name: rosdep
       run: |
