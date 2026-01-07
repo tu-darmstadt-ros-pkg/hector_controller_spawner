@@ -83,16 +83,14 @@ if(BUILD_TESTING)
 
   ament_lint_auto_find_test_dependencies()
 
-  ament_add_gtest(
-    controller_orchestrator_smart_switch_test
-    test/controller_orchestrator_smart_switch.test.cpp TIMEOUT 600)
+  ament_add_gtest(controller_orchestrator_test
+                  test/test_controller_orchestrator.cpp TIMEOUT 600)
   target_compile_definitions(
-    controller_orchestrator_smart_switch_test
+    controller_orchestrator_test
     PRIVATE TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/config")
-  target_link_libraries(controller_orchestrator_smart_switch_test
-                        ${PROJECT_NAME})
+  target_link_libraries(controller_orchestrator_test ${PROJECT_NAME})
   ament_target_dependencies(
-    controller_orchestrator_smart_switch_test
+    controller_orchestrator_test
     ament_index_cpp
     controller_manager
     controller_manager_msgs
