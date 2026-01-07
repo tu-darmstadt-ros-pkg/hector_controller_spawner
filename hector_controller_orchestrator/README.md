@@ -11,6 +11,25 @@ The `hector_controller_orchestrator` package provides a C++ library to simplify 
 
 ## Usage
 
+### Class Integration (as a Node Member)
+
+Create the orchestrator as a `shared_ptr` member of your node class. Pass your node (or `shared_from_this()`) and optionally the controller manager name (defaults to `controller_manager`).
+
+```cpp
+#include <controller_orchestrator/controller_orchestrator.hpp>
+
+class MyNode : public rclcpp::Node {
+public:
+    MyNode() : rclcpp::Node("my_node") {
+        orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
+                shared_from_this());
+    }
+
+private:
+    std::shared_ptr<controller_orchestrator::ControllerOrchestrator> orchestrator_;
+};
+```
+
 ### ⚠️ Important: Executor Requirements for Blocking Functions
 
 **Most functions in this library are blocking** and internally wait for service responses. They **cannot be called from within a callback** if your node uses a `SingleThreadedExecutor`, as this will cause a deadlock (the executor cannot process the service response while waiting in the callback).
