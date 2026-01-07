@@ -87,6 +87,14 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
           subscription_options );
 }
 
+/**
+ * @brief Asynchronous implementation of the smart switch logic.
+ *
+ * This function initiates a three-step process:
+ * 1. Fetch current controller states from the controller manager.
+ * 2. Analyze dependencies and conflicts to determine which controllers to start/stop.
+ * 3. Execute the switch through recursive async service calls to ensure correct ordering.
+ */
 void ControllerOrchestrator::smartSwitchControllerAsync(
     const std::vector<std::string> &activate_controllers,
     const std::function<void( bool success, const std::string &message )> &callback ) const
@@ -96,7 +104,7 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
     return;
   }
 
-  // check if controllers are already active
+  // optimization: skip if all requested controllers are already cached as active
   if ( areControllersActive( activate_controllers ) ) {
     callback( true, "Controller are already active. If not call refreshControllerStates." );
   }
@@ -119,6 +127,7 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
         auto to_deactivate = std::make_shared<std::vector<std::string>>();
         auto to_activate = std::make_shared<std::vector<std::string>>( activate_controllers );
 
+        // Step 2: Analysis of dependencies and resource conflicts
         if ( !smartSwitchControllerAnalysis( *to_activate, *to_deactivate, *list_resp ) ) {
           callback( false, "smartSwitchControllerAnalysis failed" );
           return;
@@ -135,18 +144,32 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
         }
 
         // Activation: Tail -> Head (Reverse Topo)
-        // smartSwitchControllerAnalysis returns Head -> Tail
+        // smartSwitchControllerAnalysis returns Head -> Tail, so we reverse it for activation
+        // such that dependencies are started before the controllers that depend on them.
         std::reverse( to_activate->begin(), to_activate->end() );
 
         if ( !to_deactivate->empty() ) {
           // Deactivation: Head -> Tail (Topo)
+          // Start deactivation process, which will trigger activation once finished.
           recursiveDeactivateControllers( to_activate, to_deactivate, 0, callback );
         } else {
+          // No deactivations needed, start activation directly.
           recursiveActivateControllers( to_activate, 0, callback );
         }
       } );
 }
 
+/**
+ * @brief Analyzes dependencies and resource conflicts to determine switch actions.
+ *
+ * The logic follows these steps:
+ * 1. Build maps of controller chains (who depends on whom).
+ * 2. Identify currently active controllers and their claimed resources.
+ * 3. Expand the 'to_activate' set to include all downstream dependencies.
+ * 4. Check for resource conflicts between the new set and currently active controllers.
+ * 5. Expand the 'to_deactivate' set to include all upstream dependents of conflicting controllers.
+ * 6. Perform a topological sort to ensure controllers are stopped/started in the correct order.
+ */
 bool ControllerOrchestrator::smartSwitchControllerAnalysis(
     std::vector<std::string> &to_activate, std::vector<std::string> &to_deactivate,
     const controller_manager_msgs::srv::ListControllers_Response &res ) const
@@ -180,7 +203,7 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   }
 
   // 4. Expand Activation Set (Downstream Dependencies Only)
-  // FIX: Unidirectional search! Only grab things we NEED (A->B), do not climb back up to competitors.
+  // We must ensure that if we start A, we also start everything A depends on.
   std::unordered_set<std::string> expanded_activation_set =
       getDownstreamDependencies( valid_requests, forward_chain );
 
@@ -200,7 +223,7 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
     }
   }
 
-  // Check against active controllers
+  // Check against active controllers for resource overlaps
   for ( const auto &active_name : currently_active_set ) {
     // If we plan to activate/reuse this controller, don't flag it as a conflict against itself
     if ( expanded_activation_set.count( active_name ) )
@@ -219,13 +242,13 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   }
 
   // 6. Expand Deactivation Set (Upstream Dependents Only)
-  // FIX: Unidirectional search! If we stop B, we must stop A (A->B).
+  // If we stop B because of a conflict, we MUST stop A if A depends on B.
   std::vector<std::string> deactivation_seed( deactivation_candidates.begin(),
                                               deactivation_candidates.end() );
   std::unordered_set<std::string> expanded_deactivation_set =
       getUpstreamDependents( deactivation_seed, reverse_chain );
 
-  // Filter deactivation set to only active ones
+  // Filter deactivation set to only those currently running
   std::unordered_set<std::string> final_deactivation_set;
   for ( const auto &name : expanded_deactivation_set ) {
     if ( currently_active_set.count( name ) )
@@ -235,7 +258,7 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   // 7. Finalize Activation List
   // We activate everything in 'expanded_activation_set' that is:
   // a) Not currently active, OR
-  // b) Currently active BUT scheduled for deactivation (Needs Restart)
+  // b) Currently active BUT scheduled for deactivation (i.e., needs a restart because one of its dependencies is restarting)
   std::unordered_set<std::string> final_activation_set;
   for ( const auto &name : expanded_activation_set ) {
     if ( !currently_active_set.count( name ) || final_deactivation_set.count( name ) ) {
@@ -244,6 +267,7 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   }
 
   // 8. Topological Sort (Head -> Tail)
+  // Ensures that controllers are returned in an order that satisfies dependency constraints.
   to_activate = topologicalSortControllers( final_activation_set, forward_chain );
   to_deactivate = topologicalSortControllers( final_deactivation_set, forward_chain );
 
@@ -253,6 +277,12 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   return true;
 }
 
+/**
+ * @brief Refreshes the internal controller state cache by querying the controller manager.
+ * @note This is a blocking call. Do not call this from within a SingleThreadedExecutor callback.
+ * @param timeout_s Timeout in seconds for the operation.
+ * @return true if the refresh was successful.
+ */
 bool ControllerOrchestrator::refreshControllerStates( int timeout_s ) const
 {
   if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
@@ -270,6 +300,11 @@ bool ControllerOrchestrator::refreshControllerStates( int timeout_s ) const
   return true;
 }
 
+/**
+ * @brief Asynchronous version of refreshControllerStates.
+ * @param callback Function to call upon completion with (success, message).
+ * @param timeout_s Timeout in seconds for the operation.
+ */
 void ControllerOrchestrator::refreshControllerStatesAsync(
     const std::function<void( bool success, const std::string &message )> &callback,
     int timeout_s ) const
@@ -338,6 +373,16 @@ void ControllerOrchestrator::recursiveDeactivateControllers(
       } );
 }
 
+/**
+ * @brief Synchronous version of smartSwitchController.
+ *
+ * This function blocks until the switch operation is complete or times out.
+ * It internally calls the asynchronous version and waits for the result.
+ * @note This is a blocking call. Do not call this from within a SingleThreadedExecutor callback.
+ * @param activate_controllers List of controllers to activate.
+ * @param timeout_s Timeout in seconds for the operation (default 2s).
+ * @return true if the switch operation was successful.
+ */
 bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &activate_controllers,
                                                     int timeout_s ) const
 {
@@ -397,6 +442,13 @@ bool ControllerOrchestrator::areControllersActive( const std::vector<std::string
   return true;
 }
 
+/**
+ * @brief Get a list of currently active controllers that claim a specific hardware interface and
+ * the controllers that depend on them (recursively).
+ * @param hardware_interface Name of the hardware interface (e.g., "joint1").
+ * @param timeout_s Timeout in seconds for the operation.
+ * @return Vector of active controller names.
+ */
 std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareInterface(
     const std::string &hardware_interface, int timeout_s ) const
 {
@@ -443,6 +495,13 @@ std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareIn
   return active_controllers;
 }
 
+/**
+ * @brief Deactivate a list of controllers.
+ * @note This is a blocking call. Do not call this from within a SingleThreadedExecutor callback.
+ * @param controllers_to_deactivate List of controller names to deactivate.
+ * @param timeout_s Timeout in seconds for the operation.
+ * @return true if the deactivation was successful.
+ */
 bool ControllerOrchestrator::deactivateControllers(
     const std::vector<std::string> &controllers_to_deactivate, int timeout_s ) const
 {
@@ -458,6 +517,13 @@ bool ControllerOrchestrator::deactivateControllers(
   return true;
 }
 
+/**
+ * @brief Activate a list of controllers.
+ * @note This is a blocking call. Do not call this from within a SingleThreadedExecutor callback.
+ * @param controllers_to_activate List of controller names to activate.
+ * @param timeout_s Timeout in seconds for the operation.
+ * @return true if the activation was successful.
+ */
 bool ControllerOrchestrator::activateControllers(
     const std::vector<std::string> &controllers_to_activate, int timeout_s ) const
 {
@@ -472,6 +538,13 @@ bool ControllerOrchestrator::activateControllers(
   return true;
 }
 
+/**
+ * @brief Unload controllers that claim a specific joint, including their dependents.
+ * @note This is a blocking call. Do not call this from within a SingleThreadedExecutor callback.
+ * @param joint_name Name of the joint.
+ * @param timeout_s Timeout in seconds for the operation.
+ * @return true if the unload was successful.
+ */
 bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_name, int timeout_s )
 {
   if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) )
@@ -529,7 +602,7 @@ void ControllerOrchestrator::buildChainConnectionMaps(
   }
 }
 
-// ---------------------- NEW HELPER: Downstream Only (Activation) ----------------------
+// -------------------------  HELPER: Downstream Only (Activation) ----------------------
 std::unordered_set<std::string> ControllerOrchestrator::getDownstreamDependencies(
     const std::vector<std::string> &seed_controllers,
     const std::unordered_map<std::string, std::vector<std::string>> &forward_connections ) const
@@ -554,7 +627,7 @@ std::unordered_set<std::string> ControllerOrchestrator::getDownstreamDependencie
   return visited;
 }
 
-// ---------------------- NEW HELPER: Upstream Only (Deactivation) ----------------------
+// -------------------------  HELPER: Upstream Only (Deactivation) ----------------------
 std::unordered_set<std::string> ControllerOrchestrator::getUpstreamDependents(
     const std::vector<std::string> &seed_controllers,
     const std::unordered_map<std::string, std::vector<std::string>> &reverse_connections ) const
@@ -578,9 +651,6 @@ std::unordered_set<std::string> ControllerOrchestrator::getUpstreamDependents(
   }
   return visited;
 }
-
-// NOTE: Replaced bidirectional 'findControllersInChain' with the specific ones above.
-// Removed 'findControllersInChain' to prevent misuse.
 
 std::vector<std::string> ControllerOrchestrator::topologicalSortControllers(
     const std::unordered_set<std::string> &active_controllers,
