@@ -1,5 +1,6 @@
-![Lint](https://github.com/tu-darmstadt-ros-pkg/hector_controller_spawner/actions/workflows/lint_build_test.yaml/badge.svg)
 # Hector Controller Tools
+![Lint](https://github.com/tu-darmstadt-ros-pkg/hector_controller_spawner/actions/workflows/lint_build_test.yaml/badge.svg)
+
 Toolkit containing:
 - **Hector Controller Spawner (Multispawner):** One-shot launcher that loads/activates hardware and controllers with chaining, retries, and optional e-stop gating.
 - **Hector Controller Orchestrator:** C++ helper library that performs dependency-aware, resource-safe controller switching. See [hector_controller_orchestrator/README.md](hector_controller_orchestrator/README.md).
