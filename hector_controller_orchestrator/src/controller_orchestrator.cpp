@@ -431,17 +431,6 @@ void ControllerOrchestrator::updateControllerStatesFromList(
   for ( const auto &ctrl : res.controller ) { controller_states_[ctrl.name] = ctrl.state; }
 }
 
-bool ControllerOrchestrator::areControllersActive( const std::vector<std::string> &controllers ) const
-{
-  std::lock_guard<std::mutex> lock( controller_states_mutex_ );
-  for ( const auto &name : controllers ) {
-    const auto it = controller_states_.find( name );
-    if ( it == controller_states_.end() || it->second != "active" )
-      return false;
-  }
-  return true;
-}
-
 /**
  * @brief Get a list of currently active controllers that claim a specific hardware interface and
  * the controllers that depend on them (recursively).
@@ -701,6 +690,20 @@ ControllerOrchestrator::buildControllerResourceMap(
                                 ctrl.required_command_interfaces.end() };
   }
   return resource_map;
+}
+
+bool ControllerOrchestrator::isControllerActive( const std::string &controller_name ) const
+{
+  std::lock_guard<std::mutex> lock( controller_states_mutex_ );
+  return std::any_of( controller_states_.begin(), controller_states_.end(), [&]( const auto &entry ) {
+    return entry.first == controller_name && entry.second == "active";
+  } );
+}
+
+bool ControllerOrchestrator::areControllersActive( const std::vector<std::string> &controller_names ) const
+{
+  return std::all_of( controller_names.begin(), controller_names.end(),
+                      [&]( const auto &name ) { return isControllerActive( name ); } );
 }
 
 } // namespace controller_orchestrator
