@@ -1,0 +1,17 @@
+repositories:
+  hector_ros_controllers:
+    type: git
+    url: https://github.com/tu-darmstadt-ros-pkg/hector_ros_controllers.git
+    version: main
+  ad_kinematics: # remove after adding repos file to hector_ros_controllers
+    type: git
+    url: https://github.com/tu-darmstadt-ros-pkg/ad_kinematics.git
+    version: main
+  hector_ros2_utils:
+    type: git
+    url: https://github.com/tu-darmstadt-ros-pkg/hector_ros2_utils.git
+    version: main
+  hector_testing_utils:
+    type: git
+    url: https://github.com/Joschi3/hector_testing_utils.git
+    version: main

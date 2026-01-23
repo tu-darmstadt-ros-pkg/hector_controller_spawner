@@ -1,11 +1,9 @@
 name: Lint, Build & Test
 on:
   push:
-    branches:
-    - jazzy
+    branches: [jazzy]
   pull_request:
-    branches:
-    - jazzy
+    branches: [jazzy]
 defaults:
   run:
     shell: bash
@@ -17,23 +15,14 @@ jobs:
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
     - name: Setup
-      run: |
-        sudo apt-get update && sudo apt-get install -y black clang-format cppcheck libxml2-utils
-
+      run: sudo apt-get update && sudo apt-get install -y black clang-format cppcheck libxml2-utils
     - name: Set up Python
       uses: actions/setup-python@v4
-
     - name: Install and Run pre-commit
       uses: pre-commit/action@v3.0.1
       with:
         extra_args: --all-files
-
-
-
 
   build-and-test:
     needs: Linting
@@ -46,39 +35,52 @@ jobs:
     container:
       image: ros:${{ matrix.setup.rosdistro }}-ros-base
     steps:
-    - name: install build tools
+    - name: Install Build Tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y ros-dev-tools
-    - uses: actions/checkout@v4
+        sudo apt-get install -y ros-dev-tools python3-vcstool
+
+    - name: Checkout Main Repo
+      uses: actions/checkout@v4
       with:
-        repository: tu-darmstadt-ros-pkg/hector_ros_controllers
-        path: src/hector_ros_controllers
-    - uses: actions/checkout@v4
-      with:
-        repository: tu-darmstadt-ros-pkg/ad_kinematics
-        path: src/ad_kinematics
-    - uses: actions/checkout@v4
-      with:
-        repository: tu-darmstadt-ros-pkg/hector_ros2_utils
-        path: src/hector_ros2_utils
-    - uses: actions/checkout@v4
-      with:
-        repository: Joschi3/hector_testing_utils
-        path: src/hector_testing_utils
-    - uses: actions/checkout@v4
-      with:
-        path: src/repo
+        path: src/main_repo
+
+    - name: Recursive VCS Import
+      run: |
+        cd src
+        # This loop finds .repos files, imports them, and repeats if new ones appear
+        # (Up to 15 levels deep to prevent infinite loops)
+        for i in {1..15}; do
+          echo "Scanning for .repos files (Level $i)..."
+          # Find all .repos files in the src directory
+          REPOS_FILES=$(find . -name "*.repos")
+          if [ -z "$REPOS_FILES" ]; then
+            echo "No .repos files found."
+            break
+          fi
+
+          NEW_CLONES=false
+          for f in $REPOS_FILES; do
+            # vcs import returns 0 even if nothing changed,
+            # but we use it to populate the directory.
+            vcs import . < "$f" && NEW_CLONES=true
+          done
+
+          if [ "$NEW_CLONES" = false ]; then break; fi
+        done
+
     - name: rosdep
       run: |
         rosdep update --rosdistro ${{ matrix.setup.rosdistro }} --include-eol-distros
         rosdep install -y --from-paths src --ignore-src --rosdistro ${{ matrix.setup.rosdistro }}
-    - name: build
+
+    - name: Build
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
-        colcon build
-    - name: test
+        colcon build --event-handlers console_direct+
+
+    - name: Test
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
-        colcon test
+        colcon test --event-handlers console_direct+
         colcon test-result --verbose
