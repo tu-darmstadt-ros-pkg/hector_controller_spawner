@@ -77,23 +77,39 @@ jobs:
         rosdep update --rosdistro ${{ matrix.setup.rosdistro }} --include-eol-distros
         rosdep install -y --from-paths src --ignore-src --rosdistro ${{ matrix.setup.rosdistro }}
 
-    - name: Build
+    - name: Identify Local Packages
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
-        colcon build --event-handlers console_direct+
+        # Using --base-paths is the reliable way to filter by directory in colcon list
+        PKGS=$(colcon list --names-only --base-paths src/${{ github.event.repository.name }})
 
-    - name: Test Local Packages Only
-      run: |
-        source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
-
-        # Dynamically retrieve package names located only within this specific repository
-        LOCAL_PKGS=$(colcon list --names-only --path-source src/${{ github.event.repository.name }})
-
-        if [ -z "$LOCAL_PKGS" ]; then
-          echo "No local packages found to test."
-          exit 0
+        if [ -z "$PKGS" ]; then
+          echo "::error::No packages found in src/${{ github.event.repository.name }}"
+          exit 1
         fi
 
-        echo "Testing: $LOCAL_PKGS"
-        colcon test --packages-select $LOCAL_PKGS --event-handlers console_direct+
+        # Save to the environment for subsequent steps in this job
+        echo "LOCAL_PKGS=$PKGS" >> $GITHUB_ENV
+        echo "Found packages: $PKGS"
+
+    - name: Build Local Packages
+      run: |
+        source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
+        # Builds local packages and only the dependencies they actually need
+        colcon build \
+          --packages-up-to ${{ env.LOCAL_PKGS }} \
+          --event-handlers console_direct+
+
+    - name: Test Local Packages
+      run: |
+        source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
+        # Only run tests for the local packages
+        colcon test \
+          --packages-select ${{ env.LOCAL_PKGS }} \
+          --event-handlers console_direct+
+
+    - name: Test Results
+      if: always()
+      run: |
+        source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
         colcon test-result --verbose

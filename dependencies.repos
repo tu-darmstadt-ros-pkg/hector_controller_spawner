@@ -2,11 +2,7 @@ repositories:
   hector_ros_controllers:
     type: git
     url: https://github.com/tu-darmstadt-ros-pkg/hector_ros_controllers.git
-    version: jazzy
-  ad_kinematics: # remove after adding repos file to hector_ros_controllers
-    type: git
-    url: https://github.com/tu-darmstadt-ros-pkg/ad_kinematics.git
-    version: jazzy
+    version: feature/dependencies_repos
   hector_ros2_utils:
     type: git
     url: https://github.com/tu-darmstadt-ros-pkg/hector_ros2_utils.git
