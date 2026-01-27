@@ -120,6 +120,19 @@ public:
   void refreshControllerStatesAsync(
       const std::function<void( bool success, const std::string &message )> &callback,
       int timeout_s = 2 ) const;
+  /**
+   * @brief Checks if the controllers is currently active.
+   * @param controller_name controller names to check
+   * @return true if the controller is active, false otherwise
+   */
+  bool isControllerActive( const std::string &controller_name ) const;
+
+  /**
+   * @brief Checks if all given controllers are currently active.
+   * @param controller_names List of controller names to check
+   * @return true if all controllers are active, false otherwise
+   */
+  bool areControllersActive( const std::vector<std::string> &controller_names ) const;
 
 private:
   // ============================================================================
@@ -132,13 +145,6 @@ private:
    */
   void updateControllerStatesFromList(
       const controller_manager_msgs::srv::ListControllers_Response &res ) const;
-
-  /**
-   * @brief Checks if all given controllers are currently active.
-   * @param controllers List of controller names to check
-   * @return true if all controllers are active, false otherwise
-   */
-  bool areControllersActive( const std::vector<std::string> &controllers ) const;
 
   // ============================================================================
   // Controller Chain Analysis

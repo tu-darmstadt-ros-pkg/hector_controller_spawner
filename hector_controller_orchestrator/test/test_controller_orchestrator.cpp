@@ -138,9 +138,36 @@ protected:
 
   void TearDown() override
   {
+    // 1. Stop the application specific logic
     stop_spawner_node();
+
+    // 2. DESTROY THE ORCHESTRATOR NOW.
+    // If this waits until the class destructor (after rclcpp::shutdown),
+    // it triggers the double free.
+    orchestrator_.reset();
+
+    // 3. Reset test clients/subs explicitly
+    activity_sub_.reset();
+    list_client_.reset();
+
+    // 4. Stop Controller Manager (joins threads, resets CM)
+    // This ensures plugins are unloaded while the context is still valid.
     stop_controller_manager();
+
+    // 5. Reset Base Class Resources
+    // Even though these are in the base class, we must kill them before
+    // calling the base TearDown which shuts down ROS.
+    if ( tester_node_ )
+      tester_node_.reset();
+
+    if ( executor_ ) {
+      // Ensure the internal thread of TestExecutor is stopped
+      executor_.reset();
+    }
+
+    // 6. NOW it is safe to shut down the global context
     HectorTestFixture::TearDown();
+
     // sleep for 0.3
     std::this_thread::sleep_for( 300ms );
   }

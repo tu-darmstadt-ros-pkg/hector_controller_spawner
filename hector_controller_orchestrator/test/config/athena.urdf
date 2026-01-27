@@ -1426,36 +1426,6 @@
     <origin rpy="0 0 3.141592653589793" xyz="0.0 0.0493634 0.0285"/>
     <!-- same as gripper_joint_r2 frame-->
   </joint>
-  <gazebo reference="gripper_joint_l2">
-    <sensor name="finger_force_torque_sensor" type="force_torque">
-      <update_rate>30.0</update_rate>
-      <always_on>true</always_on>
-      <visualize>true</visualize>
-      <gz_frame_id>gripper_joint_link_l2</gz_frame_id>
-      <topic>/athena/force_torque_sensor/finger_l/wrench</topic>
-      <force_torque name="finger">
-        <frame>child</frame>
-        <measure_direction>child_to_parent</measure_direction>
-      </force_torque>
-      <plugin filename="gz-sim-forcetorque-system" name="gz::sim::systems::ForceTorque">
-          </plugin>
-    </sensor>
-  </gazebo>
-  <gazebo reference="gripper_joint_r2">
-    <sensor name="finger_force_torque_sensor" type="force_torque">
-      <update_rate>30.0</update_rate>
-      <always_on>true</always_on>
-      <visualize>true</visualize>
-      <gz_frame_id>gripper_joint_link_r2</gz_frame_id>
-      <topic>/athena/force_torque_sensor/finger_r/wrench</topic>
-      <force_torque name="finger">
-        <frame>child</frame>
-        <measure_direction>child_to_parent</measure_direction>
-      </force_torque>
-      <plugin filename="gz-sim-forcetorque-system" name="gz::sim::systems::ForceTorque">
-          </plugin>
-    </sensor>
-  </gazebo>
   <ros2_control name="athena_flipper_interface" type="system">
     <hardware>
       <plugin>mock_components/GenericSystem</plugin>
