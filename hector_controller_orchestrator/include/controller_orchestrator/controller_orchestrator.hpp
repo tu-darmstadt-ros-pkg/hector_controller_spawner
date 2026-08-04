@@ -20,10 +20,15 @@ namespace controller_orchestrator
  *
  * This class provides high-level functions to manage controllers in a ROS 2 system.
  * It handles:
- * - Smart switching: Automatically deactivates conflicting controllers and their dependents.
- * - Chain management: Resolves downstream dependencies and upstream dependents for chained controllers.
+ * - Smart switching: Delegates dependency expansion and conflict resolution to the controller
+ *   manager via the "FORCE_AUTO" strictness of the switch_controller service, so the whole switch
+ *   is applied atomically in a single update iteration.
  * - Async/Sync operations: Provides both blocking and non-blocking interfaces for common tasks.
  * - State caching: Maintains a local cache of controller states for faster access.
+ *
+ * @note "FORCE_AUTO" requires a controller manager that implements it. Older versions accept the
+ * value but silently fall back to "BEST_EFFORT", in which case conflicting controllers are not
+ * deactivated.
  */
 class ControllerOrchestrator
 {
@@ -44,8 +49,11 @@ public:
   /**
    * @brief Tries to activate the given controllers, deactivating all conflicting controllers.
    *
-   * Conflicting controllers are those that claim the same hardware resources or are part of a
-   * dependency chain that must be stopped. This call is blocking.
+   * Issues a single "FORCE_AUTO" switch: the controller manager pulls in the chain dependencies of
+   * the requested controllers and deactivates every active controller claiming a conflicting
+   * command interface, together with everything depending on it. All controllers in the resolved
+   * chain must already be configured ('inactive' state) - the switch does not configure them.
+   * This call is blocking.
    *
    * @param activate_controllers List of controllers to activate.
    * @param timeout_s Timeout in seconds for the operation (default 2s).
@@ -57,10 +65,9 @@ public:
   /**
    * @brief Asynchronous version of smartSwitchController.
    *
-   * Analyzes dependencies and conflicts, then performs the switch operation non-blockingly.
-   *
    * @param activate_controllers List of controllers to activate.
-   * @param callback Function to call upon completion with (success, message).
+   * @param callback Function to call upon completion with (success, message). On failure the
+   * message is the one reported by the controller manager.
    */
   void smartSwitchControllerAsync(
       const std::vector<std::string> &activate_controllers,
@@ -145,125 +152,6 @@ private:
    */
   void updateControllerStatesFromList(
       const controller_manager_msgs::srv::ListControllers_Response &res ) const;
-
-  // ============================================================================
-  // Controller Chain Analysis
-  // ============================================================================
-
-  /**
-   * @brief Builds forward and reverse chain connection maps from controller information.
-   *
-   * Forward map: controller -> list of controllers it chains to
-   * Reverse map: controller -> list of controllers that chain to it
-   *
-   * @param controllers List of controller states from list_controllers response
-   * @param forward_connections Output: forward chain connections
-   * @param reverse_connections Output: reverse chain connections
-   */
-  void buildChainConnectionMaps(
-      const std::vector<controller_manager_msgs::msg::ControllerState> &controllers,
-      std::unordered_map<std::string, std::vector<std::string>> &forward_connections,
-      std::unordered_map<std::string, std::vector<std::string>> &reverse_connections ) const;
-
-  /**
-   * @brief Get all downstream dependencies of the given controllers.
-   * @param seed_controllers List of controller names to start from
-   * @param forward_connections Forward chain connection map (use buildChainConnectionMaps to create)
-   * @return Set of all downstream dependent controller names
-   */
-  std::unordered_set<std::string> getDownstreamDependencies(
-      const std::vector<std::string> &seed_controllers,
-      const std::unordered_map<std::string, std::vector<std::string>> &forward_connections ) const;
-
-  /**
-   * @brief Get all upstream dependents of the given controllers.
-   * @param seed_controllers List of controller names to start from
-   * @param reverse_connections Reverse chain connection map (use buildChainConnectionMaps to create)
-   * @return Set of all upstream dependent controller names
-   */
-  std::unordered_set<std::string> getUpstreamDependents(
-      const std::vector<std::string> &seed_controllers,
-      const std::unordered_map<std::string, std::vector<std::string>> &reverse_connections ) const;
-
-  /**
-   * @brief Performs topological sort on active controllers in a chain.
-   *
-   * Returns controllers ordered such that dependencies are satisfied:
-   * - Controllers earlier in the list should be deactivated first
-   * - Controllers later in the list should be activated first
-   *
-   * @param active_controllers Set of active controllers to sort
-   * @param forward_connections Forward chain connection map (use buildChainConnectionMaps to create)
-   * @return Topologically sorted list of controllers, or empty vector if cycle detected
-   */
-  std::vector<std::string> topologicalSortControllers(
-      const std::unordered_set<std::string> &active_controllers,
-      const std::unordered_map<std::string, std::vector<std::string>> &forward_connections ) const;
-
-  /**
-   * @brief Builds a map of controller names to their claimed command interfaces.
-   * @param controllers List of controller states from list_controllers response
-   * @return Map from controller name to vector of claimed interface names
-   */
-  std::unordered_map<std::string, std::vector<std::string>> buildControllerResourceMap(
-      const std::vector<controller_manager_msgs::msg::ControllerState> &controllers ) const;
-
-  // ============================================================================
-  // Smart Switch Analysis
-  // ============================================================================
-
-  /**
-   * @brief Analyzes which controllers to activate and deactivate for a smart switch.
-   *
-   * This method:
-   * 1. Validates requested controllers exist
-   * 2. Removes already-active controllers from activation list
-   * 3. Adds all chain-connected controllers to activation list
-   * 4. Identifies resource conflicts with currently active controllers
-   * 5. Adds conflicting controllers and their dependents to deactivation list
-   *
-   * @param to_activate Input/Output: controllers to activate (modified in place)
-   * @param to_deactivate Output: controllers that must be deactivated
-   * @param res Response from list_controllers service
-   * @return true if analysis succeeded, false on error
-   */
-  bool smartSwitchControllerAnalysis(
-      std::vector<std::string> &to_activate, std::vector<std::string> &to_deactivate,
-      const controller_manager_msgs::srv::ListControllers_Response &res ) const;
-
-  // ============================================================================
-  // Async Operations
-  // ============================================================================
-
-  /**
-   * @brief Recursively activates controllers in reverse order (last to first).
-   *
-   * This is part of the async switching mechanism. Controllers are activated
-   * one at a time, starting from the end of the list.
-   *
-   * @param controllers_to_activate Shared pointer to list of controllers
-   * @param index Current index to activate (decrements with each recursion)
-   * @param callback Callback to invoke when all activations complete or on error
-   */
-  void recursiveActivateControllers(
-      std::shared_ptr<std::vector<std::string>> controllers_to_activate, size_t index,
-      const std::function<void( bool success, const std::string &message )> &callback ) const;
-
-  /**
-   * @brief Recursively deactivates controllers in reverse order, then activates.
-   *
-   * This is part of the async switching mechanism. Controllers are deactivated
-   * one at a time from last to first, then activation begins.
-   *
-   * @param controllers_to_activate Shared pointer to list of controllers to activate after deactivation
-   * @param controllers_to_deactivate Shared pointer to list of controllers to deactivate
-   * @param index Current index to deactivate (decrements with each recursion)
-   * @param callback Callback to invoke when all operations complete or on error
-   */
-  void recursiveDeactivateControllers(
-      std::shared_ptr<std::vector<std::string>> controllers_to_activate,
-      std::shared_ptr<std::vector<std::string>> controllers_to_deactivate, size_t index,
-      const std::function<void( bool success, const std::string &message )> &callback ) const;
 
   rclcpp::Node::SharedPtr node_;
   std::string controller_manager_name_;

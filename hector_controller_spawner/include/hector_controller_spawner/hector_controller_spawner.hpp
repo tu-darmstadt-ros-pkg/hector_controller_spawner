@@ -38,11 +38,6 @@ inline std::string vecToString( const std::vector<std::string> &vec )
 class MultiSpawner final : public rclcpp::Node
 {
 public:
-  using ControllerGroup = std::vector<std::string>; // group of controllers to activate together
-  struct ControllerChainInfo {
-    std::vector<std::string> required_controllers; // controllers that must be started before this one
-    std::vector<std::string> upper_controllers;    // controllers that can be started after this one
-  };
   explicit MultiSpawner();
   explicit MultiSpawner( const rclcpp::NodeOptions &options );
   void initialize();
@@ -73,16 +68,11 @@ private:
   bool configureController( const std::string &name );
   bool replicateParamsToCM();
   void verifyFinalStates();
-  void parseControllerInfo( const controller_manager_msgs::srv::ListControllers_Response &resp,
-                            std::unordered_map<std::string, std::string> &current_state );
-  void checkRequiredControllersActive( const std::string &controller_name );
-  bool
-  validateDesiredControllerState( const controller_manager_msgs::srv::ListControllers_Response &resp );
-  bool activateControllers( const std::unordered_map<std::string, std::string> &current_state );
-  bool
-  deactivateAllActiveControllers( const std::unordered_map<std::string, std::string> &current_state );
-  bool loadControllerGroup( const std::vector<std::string> &to_activate,
-                            const std::vector<std::string> &to_deactivate );
+  /// Replace current_state with a fresh name → lifecycle state snapshot from the manager.
+  void snapshotControllerStates( std::unordered_map<std::string, std::string> &current_state );
+  /// Request the switch with "FORCE_AUTO" strictness: the controller manager expands the chain
+  /// dependencies of to_activate, deactivates whatever blocks them along with everything
+  /// depending on those, and applies the result in a single update iteration.
   bool switchControllersRequest( const std::vector<std::string> &to_activate,
                                  const std::vector<std::string> &to_deactivate );
 
@@ -90,19 +80,16 @@ private:
   std::vector<std::string> hw_interfaces_;
   std::vector<std::string> controllers_;
   std::unordered_map<std::string, ControllerCfg> controller_cfg_;
-  // std::vector<ControllerGroup> controller_groups_;
-  std::unordered_map<std::string, ControllerChainInfo> controller_info_;
   double retry_delay_{ 5.0 };
   double start_delay_{ 0.0 };
   std::string estop_topic_;
   bool restart_after_estop_deactivation_{ true };
-  bool load_groups_one_by_one_{ true };
   int service_call_timeout_ms_{ 5000 };
+  static constexpr int switch_retries_ = 3;
 
   hector::ParameterSubscription retry_delay_param_sub_;
   hector::ParameterSubscription start_delay_param_sub_;
   hector::ParameterSubscription restart_after_estop_deactivation_param_sub_;
-  hector::ParameterSubscription load_groups_one_by_one_param_sub_;
   hector::ParameterSubscription service_call_timeout_ms_param_sub_;
 
   std::atomic<bool> in_progress_{ false };

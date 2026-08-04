@@ -23,8 +23,9 @@ ready to go with minimal configuration.
 * **Hardware-first strategy:** Ensures all listed hardware interfaces are both *loaded* and *activated* (with automatic
   retries on failure).
 * **Intelligent controller loading:** Skips controllers already present - only loads and activates what’s missing.
-* **Automatic chaining:** Automatically detects and starts *chained controllers* together - no additional config
-  required.
+* **Automatic chaining:** Chain dependencies and resource conflicts are resolved by the controller manager via the
+  `FORCE_AUTO` strictness of `switch_controller`, the whole desired state is applied in a single update iteration,
+  no additional config required.
 * **Single-node simplicity:** No need to spawn one spawner per controller - Multispawner handles everything.
 * **Robust retry logic:** Retries failed hardware/controller activations with configurable delays.
 
@@ -39,7 +40,6 @@ ready to go with minimal configuration.
 | `retry_delay`                    | `double`   | `5.0`   | Delay (in seconds) between retry attempts.                                |
 | `start_delay`                     | `double`   | `0.0`   | Initial delay (in seconds) before starting the spawner process.           |
 | `srv_call_timeout_ms`             | `int`      | `5000`  | Timeout (in milliseconds) for service calls to the controller manager.    |
-| `load_groups_one_by_one`         | `bool`     | `true`  | Load controllers in groups (chained controllers together) or all at once. |
 | `estop_topic`                    | `string`   | `""`    | Topic to wait on (false ⇒ proceed). Leave empty to disable e-stop gating. |
 | `restart_after_estop_deactivation` | `bool`     | `true`  | Restart hardware and controllers after e-stop deactivation                |
 
@@ -59,8 +59,7 @@ ros2 launch hector_controller_spawner hector_controller_spawner_launch.yml
 ---
 # Hector Controller Orchestrator
 C++ utility library that makes controller switching safe and predictable in `ros2_control` systems. It:
-- Resolves chained dependencies automatically (starts dependencies first, stops dependents first).
-- Detects resource conflicts and computes which controllers must deactivate before activating new ones.
+- Resolves chained dependencies and resource conflicts through the controller manager's `FORCE_AUTO` strictness.
 - Provides synchronous and asynchronous APIs; async variants are safe for single-threaded executors.
 - Caches controller state from `controller_manager/activity` to avoid repeated service calls.
 - Exposes helper utilities to query active controllers for a hardware interface or unload all controllers claiming a joint.
