@@ -36,6 +36,10 @@ void MultiSpawner::initialize()
       shared_from_this(), "service_call_timeout_ms", std::ref( service_call_timeout_ms_ ),
       "Service call timeout in milliseconds",
       hector::ParameterOptions<int>().onValidate( []( const auto &value ) { return value > 0; } ) );
+  max_attempts_param_sub_ = hector::createReconfigurableParameter(
+      shared_from_this(), "max_attempts", std::ref( max_attempts_ ),
+      "How often a single startup step is retried before the sequence is given up on",
+      hector::ParameterOptions<int>().onValidate( []( const auto &value ) { return value > 0; } ) );
   for ( const auto &ctrl : controllers_ ) {
     ControllerCfg cfg;
     cfg.activate = this->declare_parameter<bool>( ctrl + ".activate", true );
@@ -53,6 +57,8 @@ void MultiSpawner::initialize()
     ss << "    - " << ctrl << " (activate: " << controller_cfg_.at( ctrl ).activate << ")\n";
   }
   ss << "  retry_delay: " << retry_delay_ << " seconds\n";
+  ss << "  max_attempts: " << max_attempts_ << "\n";
+  ss << "  service_call_timeout_ms: " << service_call_timeout_ms_ << "\n";
   ss << "  estop_topic: '" << estop_topic_ << "'\n";
   RCLCPP_DEBUG( get_logger(), "%s", ss.str().c_str() );
 
@@ -101,9 +107,35 @@ void MultiSpawner::estopCb( const std_msgs::msg::Bool::SharedPtr msg )
   released_ = !msg->data;
 }
 
-void MultiSpawner::start_sequence( bool initial_init )
+bool MultiSpawner::retryUntil( const std::string &what, const std::function<bool()> &attempt )
+{
+  for ( int attempt_no = 1; rclcpp::ok(); ++attempt_no ) {
+    if ( attempt() )
+      return true;
+    if ( attempt_no >= max_attempts_ ) {
+      RCLCPP_ERROR( get_logger(), "%s failed after %d attempts – giving up.", what.c_str(),
+                    attempt_no );
+      return false;
+    }
+    RCLCPP_WARN( get_logger(), "%s failed (attempt %d/%d) – retrying in %.1fs", what.c_str(),
+                 attempt_no, max_attempts_, retry_delay_ );
+    // retry_delay_ is reconfigurable at runtime, so the wait is recomputed on every pass.
+    rclcpp::sleep_for( std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>( retry_delay_ ) ) );
+  }
+  RCLCPP_WARN( get_logger(), "%s aborted – context was shut down.", what.c_str() );
+  return false;
+}
+
+bool MultiSpawner::start_sequence( bool initial_init )
 {
   in_progress_ = true;
+  // Every early return has to clear in_progress_, otherwise the main loop never offers the
+  // sequence again after a failure.
+  const auto fail = [this]() {
+    in_progress_ = false;
+    return false;
+  };
 
   if ( start_delay_ > 0.0 ) {
     RCLCPP_INFO( get_logger(), "Delaying start sequence by %.1f seconds...", start_delay_ );
@@ -112,13 +144,16 @@ void MultiSpawner::start_sequence( bool initial_init )
     rclcpp::sleep_for( delay );
   }
 
-  const auto sleep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::duration<double>( retry_delay_ ) );
-
   // ===== Controller Manager Availability =================================
-  while ( rclcpp::ok() && !list_ctrl_client_->wait_for_service( sleep_ns ) ) {
+  // Deliberately unbounded: the manager may legitimately start after us, and there is nothing
+  // useful to do until it does.
+  while ( rclcpp::ok() &&
+          !list_ctrl_client_->wait_for_service( std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::duration<double>( retry_delay_ ) ) ) ) {
     RCLCPP_WARN( get_logger(), "Controller Manager is not yet available %.1fs", retry_delay_ );
   }
+  if ( !rclcpp::ok() )
+    return fail();
 
   if ( initial_init ) {
     // ===== Copy Parameters ==================================================
@@ -127,43 +162,23 @@ void MultiSpawner::start_sequence( bool initial_init )
   } else {
     // ===== Restart Necessary ?  ==============================================
     // test if hardware interfaces are available -> if not redo start sequence
-    auto list_hw_fut = list_hardware_ctrl_client_->async_send_request(
-        std::make_shared<controller_manager_msgs::srv::ListHardwareComponents::Request>() );
-    if ( rclcpp::spin_until_future_complete( shared_from_this(), list_hw_fut, serviceCallTimeout() ) !=
-         rclcpp::FutureReturnCode::SUCCESS ) {
-      RCLCPP_WARN( get_logger(), "Failed to list hardware components" );
-    }
-    auto list_hw_resp = list_hw_fut.get();
-    size_t active_hw_interfaces = 0;
-    for ( const auto &hw : list_hw_resp->component ) {
-      if ( hw.state.id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE &&
-           std::find( hw_interfaces_.begin(), hw_interfaces_.end(), hw.name ) !=
-               hw_interfaces_.end() ) {
-        active_hw_interfaces++;
-      }
-    }
-    if ( active_hw_interfaces == hw_interfaces_.size() ) {
+    if ( hardwareInterfacesStillActive() ) {
       RCLCPP_INFO( get_logger(),
                    "Hardware interfaces are still available after e-stop deactivation. No need to "
                    "redo hw interface and controller start sequence." );
       in_progress_ = false;
       done_ = true;
-      return;
+      return true;
     }
     RCLCPP_INFO( get_logger(), "Hardware Interface must be reactivated after estop deactivation" );
   }
 
   // ===== Hardware =========================================================
   for ( const auto &hw : hw_interfaces_ ) {
-    while ( rclcpp::ok() ) {
-      if ( loadAndActivateHardware( hw ) ) {
-        RCLCPP_DEBUG( get_logger(), "Hardware '%s' is active.", hw.c_str() );
-        break;
-      }
-      RCLCPP_WARN( get_logger(), "Hardware '%s' failed – retrying in %.1fs", hw.c_str(),
-                   retry_delay_ );
-      rclcpp::sleep_for( sleep_ns );
-    }
+    if ( !retryUntil( "Activating hardware '" + hw + "'",
+                      [&] { return loadAndActivateHardware( hw ); } ) )
+      return fail();
+    RCLCPP_DEBUG( get_logger(), "Hardware '%s' is active.", hw.c_str() );
   }
 
   // ===== Controllers ======================================================
@@ -179,20 +194,31 @@ void MultiSpawner::start_sequence( bool initial_init )
   }
 
   for ( const auto &name : to_load ) {
-    while ( rclcpp::ok() ) {
-      if ( loadController( name ) ) {
-        RCLCPP_INFO( get_logger(), "Controller '%s' loaded.", name.c_str() );
-        break;
-      }
-      RCLCPP_WARN( get_logger(), "Failed to load '%s' – retrying in %.1fs", name.c_str(),
-                   retry_delay_ );
-      rclcpp::sleep_for( sleep_ns );
-    }
+    // A client-side timeout does not cancel the request - the manager may well have finished the
+    // load while we stopped waiting for the reply. Re-reading its controller list before giving up
+    // turns that race into a success. Without it every retry hits "a controller named '<name>' was
+    // already loaded", which is reported as a plain failure, and the loop never terminates.
+    const auto load_or_confirm = [&] {
+      if ( loadController( name ) )
+        return true;
+      std::unordered_map<std::string, std::string> fresh;
+      snapshotControllerStates( fresh );
+      if ( fresh.find( name ) == fresh.end() )
+        return false;
+      RCLCPP_INFO( get_logger(), "Controller '%s' had already been loaded by an earlier attempt.",
+                   name.c_str() );
+      return true;
+    };
+    if ( !retryUntil( "Loading controller '" + name + "'", load_or_confirm ) )
+      return fail();
+    RCLCPP_INFO( get_logger(), "Controller '%s' loaded.", name.c_str() );
   }
 
   // A controller has to reach 'inactive' before it can be activated - the switch below does not
   // configure controllers, it only activates and deactivates them. Freshly loaded controllers are
   // unconfigured, and so is one that a previous run loaded but failed to configure.
+  // Re-configuring an already inactive controller is a no-op for the manager, so a retry after a
+  // timed-out call is harmless here.
   std::vector<std::string> to_configure = to_load;
   for ( const auto &name : controllers_ ) {
     const auto it = current_state.find( name );
@@ -201,15 +227,10 @@ void MultiSpawner::start_sequence( bool initial_init )
   }
 
   for ( const auto &name : to_configure ) {
-    while ( rclcpp::ok() ) {
-      if ( configureController( name ) ) {
-        RCLCPP_INFO( get_logger(), "Controller '%s' configured.", name.c_str() );
-        break;
-      }
-      RCLCPP_WARN( get_logger(), "Failed to configure '%s' – retrying in %.1fs", name.c_str(),
-                   retry_delay_ );
-      rclcpp::sleep_for( sleep_ns );
-    }
+    if ( !retryUntil( "Configuring controller '" + name + "'",
+                      [&] { return configureController( name ); } ) )
+      return fail();
+    RCLCPP_INFO( get_logger(), "Controller '%s' configured.", name.c_str() );
   }
 
   if ( !to_configure.empty() )
@@ -244,22 +265,43 @@ void MultiSpawner::start_sequence( bool initial_init )
   RCLCPP_INFO( get_logger(), "Switching controllers – activate: [%s], deactivate: [%s]",
                vecToString( to_activate ).c_str(), vecToString( to_deactivate ).c_str() );
 
-  for ( int attempt = 1; rclcpp::ok(); ++attempt ) {
-    if ( switchControllersRequest( to_activate, to_deactivate ) )
-      break;
-    if ( attempt >= switch_retries_ ) {
-      RCLCPP_ERROR( get_logger(), "Controller switch failed after %d attempts.", attempt );
-      break;
-    }
-    RCLCPP_WARN( get_logger(), "Controller switch failed – retrying in %.1fs", retry_delay_ );
-    rclcpp::sleep_for( sleep_ns );
-  }
+  if ( !retryUntil( "Controller switch",
+                    [&] { return switchControllersRequest( to_activate, to_deactivate ); } ) )
+    return fail();
 
   // ===== Done =============================================================
-  verifyFinalStates();
+  const bool states_as_configured = verifyFinalStates();
   RCLCPP_INFO( get_logger(), " Multi Controller Spawner complete – shutting down." );
   done_.store( true );
   in_progress_ = false;
+  return states_as_configured;
+}
+
+bool MultiSpawner::hardwareInterfacesStillActive()
+{
+  if ( !list_hardware_ctrl_client_->wait_for_service( serviceCallTimeout() ) ) {
+    RCLCPP_WARN( get_logger(), "list_hardware_components service unavailable" );
+    return false;
+  }
+  auto fut = list_hardware_ctrl_client_->async_send_request(
+      std::make_shared<controller_manager_msgs::srv::ListHardwareComponents::Request>() );
+  if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) !=
+       rclcpp::FutureReturnCode::SUCCESS ) {
+    // The future is never fulfilled after a timeout, so calling get() on it would block this
+    // thread forever - nothing else spins the node. Drop the request instead.
+    list_hardware_ctrl_client_->remove_pending_request( fut );
+    RCLCPP_WARN( get_logger(), "Failed to list hardware components" );
+    return false;
+  }
+  const auto resp = fut.get();
+  size_t active_hw_interfaces = 0;
+  for ( const auto &hw : resp->component ) {
+    if ( hw.state.id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE &&
+         std::find( hw_interfaces_.begin(), hw_interfaces_.end(), hw.name ) != hw_interfaces_.end() ) {
+      active_hw_interfaces++;
+    }
+  }
+  return active_hw_interfaces == hw_interfaces_.size();
 }
 
 bool MultiSpawner::switchControllersRequest( const std::vector<std::string> &to_activate,
@@ -280,6 +322,7 @@ bool MultiSpawner::switchControllersRequest( const std::vector<std::string> &to_
   auto fut = switch_ctrl_client_->async_send_request( req );
   if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) !=
        rclcpp::FutureReturnCode::SUCCESS ) {
+    switch_ctrl_client_->remove_pending_request( fut );
     RCLCPP_ERROR( get_logger(), "switch_controller call did not complete" );
     return false;
   }
@@ -301,6 +344,7 @@ void MultiSpawner::snapshotControllerStates( std::unordered_map<std::string, std
   auto fut = list_ctrl_client_->async_send_request( req );
   if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) !=
        rclcpp::FutureReturnCode::SUCCESS ) {
+    list_ctrl_client_->remove_pending_request( fut );
     RCLCPP_WARN( get_logger(), "Failed to list controllers" );
     return;
   }
@@ -325,6 +369,7 @@ bool MultiSpawner::loadAndActivateHardware( const std::string &name )
   auto act_future = set_hw_state_client_->async_send_request( act_req );
   if ( rclcpp::spin_until_future_complete( shared_from_this(), act_future, serviceCallTimeout() ) !=
        rclcpp::FutureReturnCode::SUCCESS ) {
+    set_hw_state_client_->remove_pending_request( act_future );
     return false;
   }
   return act_future.get()->ok;
@@ -338,9 +383,12 @@ bool MultiSpawner::loadController( const std::string &name )
   const auto req = std::make_shared<controller_manager_msgs::srv::LoadController::Request>();
   req->name = name;
   auto fut = load_ctrl_client_->async_send_request( req );
-  return rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) ==
-             rclcpp::FutureReturnCode::SUCCESS &&
-         fut.get()->ok;
+  if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) !=
+       rclcpp::FutureReturnCode::SUCCESS ) {
+    load_ctrl_client_->remove_pending_request( fut );
+    return false;
+  }
+  return fut.get()->ok;
 }
 
 bool MultiSpawner::configureController( const std::string &name )
@@ -350,12 +398,15 @@ bool MultiSpawner::configureController( const std::string &name )
   const auto req = std::make_shared<controller_manager_msgs::srv::ConfigureController::Request>();
   req->name = name;
   auto fut = configure_ctrl_client_->async_send_request( req );
-  return rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) ==
-             rclcpp::FutureReturnCode::SUCCESS &&
-         fut.get()->ok;
+  if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) !=
+       rclcpp::FutureReturnCode::SUCCESS ) {
+    configure_ctrl_client_->remove_pending_request( fut );
+    return false;
+  }
+  return fut.get()->ok;
 }
 
-void MultiSpawner::verifyFinalStates()
+bool MultiSpawner::verifyFinalStates()
 {
   static const char *GREEN = "\033[32m";
   static const char *RED = "\033[31m";
@@ -364,15 +415,16 @@ void MultiSpawner::verifyFinalStates()
   if ( !list_ctrl_client_->wait_for_service( 2s ) ) {
     RCLCPP_WARN( get_logger(),
                  "Cannot verify final controller states – list_controllers unavailable." );
-    return;
+    return false;
   }
 
   auto req = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
   auto fut = list_ctrl_client_->async_send_request( req );
   if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) !=
        rclcpp::FutureReturnCode::SUCCESS ) {
+    list_ctrl_client_->remove_pending_request( fut );
     RCLCPP_WARN( get_logger(), "Failed to query controller states for final verification." );
-    return;
+    return false;
   }
 
   std::unordered_map<std::string, std::string> state;
@@ -417,9 +469,11 @@ void MultiSpawner::verifyFinalStates()
   }
   report << ( ( fail_cnt > 0 ) ? RED : GREEN ) << "Summary: " << ok_cnt << " OK / " << fail_cnt
          << " failed." << RESET;
-  if ( fail_cnt == 0 )
+  if ( fail_cnt == 0 ) {
     RCLCPP_INFO( get_logger(), "%s", report.str().c_str() );
-  else
-    RCLCPP_WARN( get_logger(), "%s", report.str().c_str() );
+    return true;
+  }
+  RCLCPP_ERROR( get_logger(), "%s", report.str().c_str() );
+  return false;
 }
 } // namespace hector_controller_spawner

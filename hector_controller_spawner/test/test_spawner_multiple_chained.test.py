@@ -1,69 +1,26 @@
 import os
+import sys
 import unittest
-from ament_index_python.packages import get_package_share_directory
-import launch
-import launch.actions
-import launch_ros.actions
-import launch_testing
-import launch_testing.actions
 
+import launch_testing
 import rclpy
 from rclpy.node import Node
-from controller_manager_msgs.srv import ListControllers, ListHardwareComponents
+
+sys.path.insert(0, os.path.dirname(__file__))
+from spawner_test_utils import (  # noqa: E402
+    assert_controller_states,
+    assert_hardware_components_loaded,
+    make_test_description,
+)
+
+ROS_DOMAIN_ID = 93
 
 
 def generate_test_description():
-    pkg_share = get_package_share_directory("hector_controller_spawner")
-
-    controller_config = os.path.join(
-        pkg_share, "test", "config", "controllers_multiple_chained.yaml"
-    )
-    spawner_config = os.path.join(
-        pkg_share, "test", "config", "controller_spawner_multiple_chained.yaml"
-    )
-    robot_description_file = os.path.join(pkg_share, "test", "config", "athena.urdf")
-
-    for path in [controller_config, spawner_config, robot_description_file]:
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Missing test file: {path}")
-
-    with open(robot_description_file, "r") as f:
-        robot_description = f.read()
-
-    robot_state_publisher = launch_ros.actions.Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        name="robot_state_publisher",
-        output="screen",
-        parameters=[{"robot_description": robot_description}],
-    )
-
-    controller_manager = launch_ros.actions.Node(
-        package="controller_manager",
-        executable="ros2_control_node",
-        output="screen",
-        parameters=[controller_config],
-    )
-
-    spawner_node = launch_ros.actions.Node(
-        package="hector_controller_spawner",
-        executable="hector_controller_spawner",
-        output="screen",
-        parameters=[spawner_config],
-    )
-
-    return (
-        launch.LaunchDescription(
-            [
-                robot_state_publisher,
-                controller_manager,
-                launch.actions.TimerAction(period=5.0, actions=[spawner_node]),
-                launch.actions.TimerAction(
-                    period=10.0, actions=[launch_testing.actions.ReadyToTest()]
-                ),
-            ]
-        ),
-        {"controller_manager": controller_manager, "spawner_node": spawner_node},
+    return make_test_description(
+        controller_config="controllers_multiple_chained.yaml",
+        spawner_config="controller_spawner_multiple_chained.yaml",
+        domain_id=ROS_DOMAIN_ID,
     )
 
 
@@ -79,65 +36,28 @@ class TestControllerSpawner(unittest.TestCase):
         rclpy.shutdown()
 
     def test_hardware_interfaces_loaded(self):
-        client = self.node.create_client(
-            ListHardwareComponents, "/controller_manager/list_hardware_components"
+        assert_hardware_components_loaded(
+            self, self.node, ["athena_flipper_interface", "athena_arm_interface"]
         )
-
-        self.assertTrue(client.wait_for_service(timeout_sec=10.0))
-
-        request = ListHardwareComponents.Request()
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec=10.0)
-
-        response = future.result()
-        self.assertIsNotNone(response)
-
-        expected_interfaces = ["athena_flipper_interface", "athena_arm_interface"]
-        loaded_interfaces = [iface.name for iface in response.component]
-
-        self.assertGreater(len(loaded_interfaces), 0, "No hardware interfaces loaded")
-        for iface in expected_interfaces:
-            self.assertIn(iface, loaded_interfaces)
 
     def test_controllers_loaded_and_activated(self):
-        client = self.node.create_client(
-            ListControllers, "/controller_manager/list_controllers"
+        assert_controller_states(
+            self,
+            self.node,
+            {
+                "joint_state_broadcaster": "active",
+                "vel_to_pos_controller": "active",
+                "flipper_safety_position_controller": "active",
+                "flipper_velocity_controller": "active",
+                "gripper_trajectory_controller": "active",
+                "arm_trajectory_controller": "active",
+                "arm_safety_position_controller": "active",
+                "flipper_trajectory_controller": "inactive",
+            },
         )
-
-        self.assertTrue(client.wait_for_service(timeout_sec=10.0))
-
-        request = ListControllers.Request()
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec=10.0)
-
-        response = future.result()
-        self.assertIsNotNone(response)
-
-        expected_active = [
-            "joint_state_broadcaster",
-            "vel_to_pos_controller",
-            "flipper_safety_position_controller",
-            "flipper_velocity_controller",
-            "gripper_trajectory_controller",
-            "arm_trajectory_controller",
-            "arm_safety_position_controller",
-        ]
-        expected_inactive = ["flipper_trajectory_controller"]
-
-        loaded_controllers = {ctrl.name: ctrl.state for ctrl in response.controller}
-        self.node.get_logger().info(f"Loaded controllers: {loaded_controllers}")
-
-        for controller in expected_active:
-            self.assertIn(controller, loaded_controllers)
-            self.assertEqual(loaded_controllers[controller], "active")
-
-        for controller in expected_inactive:
-            self.assertIn(controller, loaded_controllers)
-            self.assertEqual(loaded_controllers[controller], "inactive")
 
 
 @launch_testing.post_shutdown_test()
 class TestProcessOutput(unittest.TestCase):
     def test_exit_codes(self, proc_info):
-        # You can disable this assert if controller_manager fails to shutdown cleanly
         self.assertEqual(proc_info["hector_controller_spawner"].returncode, 0)

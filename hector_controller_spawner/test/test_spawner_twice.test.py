@@ -1,62 +1,29 @@
 import os
+import sys
 import unittest
-import subprocess
-import time
-from ament_index_python.packages import get_package_share_directory
-import launch
-import launch.actions
-import launch_ros.actions
-import launch_testing
-import launch_testing.actions
 
+import launch_testing
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
-from controller_manager_msgs.srv import ListControllers
+
+sys.path.insert(0, os.path.dirname(__file__))
+from spawner_test_utils import (  # noqa: E402
+    get_controllers,
+    make_test_description,
+    poll_until,
+    run_spawner_to_completion,
+)
+
+ROS_DOMAIN_ID = 95
 
 
 def generate_test_description():
-    pkg_share = get_package_share_directory("hector_controller_spawner")
-
-    controller_config = os.path.join(pkg_share, "test", "config", "controllers.yaml")
-    spawner_config = os.path.join(
-        pkg_share, "test", "config", "controller_spawner.yaml"
-    )
-    robot_description_file = os.path.join(pkg_share, "test", "config", "athena.urdf")
-
-    for path in [controller_config, spawner_config, robot_description_file]:
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Missing test file: {path}")
-
-    with open(robot_description_file, "r") as f:
-        robot_description = f.read()
-
-    robot_state_publisher = launch_ros.actions.Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        name="robot_state_publisher",
-        output="screen",
-        parameters=[{"robot_description": robot_description}],
-    )
-
-    controller_manager = launch_ros.actions.Node(
-        package="controller_manager",
-        executable="ros2_control_node",
-        output="screen",
-        parameters=[controller_config],
-    )
-
-    # Don't launch spawner automatically - we'll control it manually
-    return (
-        launch.LaunchDescription(
-            [
-                robot_state_publisher,
-                controller_manager,
-                launch.actions.TimerAction(
-                    period=5.0, actions=[launch_testing.actions.ReadyToTest()]
-                ),
-            ]
-        ),
-        {"controller_manager": controller_manager},
+    # No spawner in the description - this test starts it itself, twice.
+    return make_test_description(
+        controller_config="controllers.yaml",
+        spawner_config=None,
+        domain_id=ROS_DOMAIN_ID,
     )
 
 
@@ -72,14 +39,13 @@ class TestControllerSpawnerIdempotency(unittest.TestCase):
         rclpy.shutdown()
 
     def test_spawner_run_twice_idempotent(self):
-        """Test that running the spawner twice doesn't cause problems"""
+        """Running the spawner a second time must leave the controller states unchanged."""
 
         pkg_share = get_package_share_directory("hector_controller_spawner")
         spawner_config = os.path.join(
             pkg_share, "test", "config", "controller_spawner.yaml"
         )
 
-        # Spawner command
         cmd = [
             "ros2",
             "run",
@@ -90,146 +56,81 @@ class TestControllerSpawnerIdempotency(unittest.TestCase):
             spawner_config,
         ]
 
-        # 1. Check initial state (no controllers loaded)
-        initial_controllers = self._get_controller_list()
-        initial_count = len(initial_controllers)
-        self.node.get_logger().info(f"Initial controller count: {initial_count}")
-
-        # 2. Run spawner first time
-        self.node.get_logger().info("Running spawner first time...")
-        process1 = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        # Wait for spawner to complete
-        return_code1 = process1.wait(timeout=30)  # 30 second timeout
-
-        stdout1, stderr1 = process1.communicate()
-        self.assertEqual(
-            return_code1, 0, f"First spawner run failed with return code {return_code1}"
-        )
-
-        # Give time for controllers to be loaded
-        time.sleep(2.0)
-
-        # 3. Check state after first run
-        first_run_controllers = self._get_controller_list()
-        first_run_count = len(first_run_controllers)
-        self.node.get_logger().info(
-            f"Controller count after first run: {first_run_count}"
-        )
-
-        self.assertGreater(
-            first_run_count,
-            initial_count,
-            "Controllers should be loaded after first spawner run",
-        )
-
-        # Store the state for comparison
-        first_run_active = [
-            c.name for c in first_run_controllers if c.state == "active"
-        ]
-        first_run_inactive = [
-            c.name for c in first_run_controllers if c.state == "inactive"
-        ]
-
-        # 4. Wait a bit, then run spawner second time
-        time.sleep(3.0)  # Delay between runs
-
-        self.node.get_logger().info("Running spawner second time...")
-        process2 = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        # Wait for second spawner to complete
-        return_code2 = process2.wait(timeout=30)
-
-        stdout2, stderr2 = process2.communicate()
-        self.assertEqual(
-            return_code2,
-            0,
-            f"Second spawner run failed with return code {return_code2}",
-        )
-
-        # Give time for any changes to take effect
-        time.sleep(2.0)
-
-        # 5. Check state after second run
-        second_run_controllers = self._get_controller_list()
-        second_run_count = len(second_run_controllers)
-        self.node.get_logger().info(
-            f"Controller count after second run: {second_run_count}"
-        )
-
-        second_run_active = [
-            c.name for c in second_run_controllers if c.state == "active"
-        ]
-        second_run_inactive = [
-            c.name for c in second_run_controllers if c.state == "inactive"
-        ]
-
-        # 6. Verify that the state is identical (idempotent behavior)
-        self.assertEqual(
-            first_run_count,
-            second_run_count,
-            "Controller count should be the same after second spawner run",
-        )
-
-        # Check that active controllers are the same
-        self.assertEqual(
-            set(first_run_active),
-            set(second_run_active),
-            "Active controllers should be identical after second run",
-        )
-
-        # Check that inactive controllers are the same
-        self.assertEqual(
-            set(first_run_inactive),
-            set(second_run_inactive),
-            "Inactive controllers should be identical after second run",
-        )
-
-        # 7. Verify expected controllers are still in correct states
-        expected_active = [
+        expected_active = {
             "joint_state_broadcaster",
             "flipper_velocity_controller",
             "gripper_trajectory_controller",
             "arm_trajectory_controller",
             "vel_to_pos_controller",
-        ]
+        }
 
-        for controller in expected_active:
-            self.assertIn(
-                controller,
-                second_run_active,
-                f"Controller {controller} should still be active after second run",
-            )
+        # 1. Initial state - the manager has nothing loaded yet.
+        initial_count = len(self._controller_states())
+        self.node.get_logger().info(f"Initial controller count: {initial_count}")
 
-        # Log the outputs for debugging if needed
-        if stdout1:
-            self.node.get_logger().info(
-                f"First spawner stdout: {stdout1.decode()[:200]}..."
-            )
-        if stdout2:
-            self.node.get_logger().info(
-                f"Second spawner stdout: {stdout2.decode()[:200]}..."
-            )
-
-    def _get_controller_list(self):
-        """Helper to get current controller list"""
-        client = self.node.create_client(
-            ListControllers, "/controller_manager/list_controllers"
+        # 2. First run. The subprocess inherits ROS_DOMAIN_ID from this process, so it talks to
+        #    the manager launched for this test.
+        self.node.get_logger().info("Running spawner first time...")
+        return_code, stdout, stderr = run_spawner_to_completion(self, cmd)
+        self.assertEqual(
+            return_code,
+            0,
+            f"First spawner run failed with return code {return_code}\n"
+            f"stdout:\n{stdout}\nstderr:\n{stderr}",
         )
 
-        if not client.wait_for_service(timeout_sec=5.0):
-            return []
+        # 3. State after the first run. The spawner exits once the switch is through, but the
+        #    manager applies it in its own update loop, so wait for it to land.
+        first_run = poll_until(
+            self._controller_states,
+            lambda states: expected_active.issubset(
+                {n for n, s in states.items() if s == "active"}
+            ),
+        )
+        self.node.get_logger().info(f"State after first run: {first_run}")
+        self.assertGreater(
+            len(first_run),
+            initial_count,
+            "Controllers should be loaded after the first spawner run",
+        )
+        for controller in expected_active:
+            self.assertEqual(
+                first_run.get(controller),
+                "active",
+                f"Controller {controller} should be active after the first run. Seen: {first_run}",
+            )
 
-        request = ListControllers.Request()
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec=5.0)
+        # 4. Second run against a manager that already has everything loaded and running. This is
+        #    the case that used to hang: load_controller reports failure for an already-loaded
+        #    controller, so a spawner that cannot tell the two apart never terminates.
+        self.node.get_logger().info("Running spawner second time...")
+        return_code, stdout, stderr = run_spawner_to_completion(self, cmd)
+        self.assertEqual(
+            return_code,
+            0,
+            f"Second spawner run failed with return code {return_code}\n"
+            f"stdout:\n{stdout}\nstderr:\n{stderr}",
+        )
 
-        response = future.result()
-        return response.controller if response else []
+        # 5. Nothing may have changed. Poll for a state that equals the first run's rather than
+        #    sampling once, so a transient mid-switch snapshot cannot fail the comparison.
+        second_run = poll_until(
+            self._controller_states, lambda states: states == first_run
+        )
+        self.node.get_logger().info(f"State after second run: {second_run}")
+        self.assertEqual(
+            second_run,
+            first_run,
+            "Controller states should be identical after the second spawner run",
+        )
+
+    def _controller_states(self):
+        return {c.name: c.state for c in get_controllers(self.node)}
 
 
 @launch_testing.post_shutdown_test()
 class TestProcessOutput(unittest.TestCase):
     def test_exit_codes(self, proc_info):
-        # Controller manager should shutdown cleanly
-        pass  # Allow flexible exit codes since we're not checking spawner here
+        # The spawner processes are started by the test itself and checked there; nothing in the
+        # launch description is asserted on here.
+        pass

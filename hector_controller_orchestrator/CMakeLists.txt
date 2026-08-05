@@ -100,6 +100,14 @@ if(BUILD_TESTING)
     realtime_tools
     rclcpp
     std_msgs)
+  # This test brings up its own node called /controller_manager, and so does
+  # every launch test in hector_controller_spawner. colcon is free to run those
+  # packages concurrently, so pin a domain nothing else in the workspace uses to
+  # keep the clients off each other's manager.
+  set_tests_properties(
+    controller_orchestrator_test
+    PROPERTIES ENVIRONMENT
+               "ROS_DOMAIN_ID=97;ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST")
 endif()
 
 ament_package()

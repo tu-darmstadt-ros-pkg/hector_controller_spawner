@@ -45,6 +45,7 @@ if(BUILD_TESTING)
   add_launch_test(test/test_spawner_chain_detection.test.py TIMEOUT 360)
   add_launch_test(test/test_spawner_multiple_chained.test.py TIMEOUT 360)
   add_launch_test(test/test_spawner_start_partial_chain.test.py TIMEOUT 360)
+  add_launch_test(test/test_spawner_gives_up.test.py TIMEOUT 360)
 endif()
 
 install(

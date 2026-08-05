@@ -4,7 +4,7 @@
     estop_topic: estop_board/hard_estop
 
     # How long to wait between retry attempts (HW + controllers).
-    retry_delay: 5.0
+    retry_delay: 1.0
 
     # ---------- hardware interfaces (activate = always) ----------
     hardware_interfaces:
