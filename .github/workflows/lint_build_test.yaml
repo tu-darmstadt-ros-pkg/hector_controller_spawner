@@ -50,7 +50,7 @@ jobs:
         cd src
         PREVIOUS_HASH=""
         for i in {1..10}; do
-          REPOS_FILES=$(find . -name "*.repos")
+          REPOS_FILES=$(find . -name "dependencies.repos")
           CURRENT_HASH=$(echo "$REPOS_FILES" | sort | md5sum)
           if [ "$CURRENT_HASH" == "$PREVIOUS_HASH" ]; then
             echo "Dependency tree fully resolved at level $((i-1))."
@@ -65,11 +65,9 @@ jobs:
 
     - name: Prune ros2_control to the forked package
       run: |
-        # Only controller_manager differs from the released debs
         cd src/ros2_control
-        find . -mindepth 1 -maxdepth 1 -type d ! -name controller_manager ! -name '.*' \
-          -exec rm -rf {} +
-        echo "Kept:"; ls
+        find . -mindepth 1 -maxdepth 1 ! -name controller_manager ! -name '.*' -exec rm -rf {} +
+        echo "Kept:"; ls -a
 
     - name: rosdep
       run: |
