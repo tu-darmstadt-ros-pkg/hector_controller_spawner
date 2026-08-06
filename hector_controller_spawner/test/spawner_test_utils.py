@@ -162,6 +162,22 @@ def get_active_hardware(node, timeout_sec=10.0):
     ]
 
 
+def wait_for_spawner_exit(
+    proc_info, timeout_sec=DEFAULT_TIMEOUT_SEC, process="hector_controller_spawner"
+):
+    """Block until the one-shot spawner process has exited on its own.
+
+    Without a spawner configured for e-stop the process runs its sequence and terminates. If the
+    active test phase ends while it is still winding down, launch_testing SIGINTs whatever is left
+    running - and by then the spawner has already called rclcpp::shutdown(), which uninstalls
+    rclcpp's signal handler, so the default one kills it with -2. The post-shutdown exit code
+    assertion would be reporting that teardown race instead of the spawner's actual result.
+
+    It doubles as a synchronisation point: the spawner only exits once its sequence is complete.
+    """
+    proc_info.assertWaitForShutdown(process=process, timeout=timeout_sec)
+
+
 def poll_until(probe, done, timeout_sec=DEFAULT_TIMEOUT_SEC):
     """Call probe() until done(result) holds or the deadline passes. Returns the last result.
 

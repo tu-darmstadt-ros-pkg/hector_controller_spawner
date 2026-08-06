@@ -11,6 +11,7 @@ from spawner_test_utils import (  # noqa: E402
     assert_controller_states,
     assert_hardware_components_loaded,
     make_test_description,
+    wait_for_spawner_exit,
 )
 
 ROS_DOMAIN_ID = 93
@@ -55,6 +56,11 @@ class TestControllerSpawner(unittest.TestCase):
                 "flipper_trajectory_controller": "inactive",
             },
         )
+
+    def test_spawner_exits_cleanly(self, proc_info):
+        # Must happen while the launch is still up, so the spawner is gone before teardown
+        # starts signalling processes. See wait_for_spawner_exit().
+        wait_for_spawner_exit(proc_info)
 
 
 @launch_testing.post_shutdown_test()
