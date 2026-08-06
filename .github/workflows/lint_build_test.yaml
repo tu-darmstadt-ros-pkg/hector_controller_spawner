@@ -63,6 +63,14 @@ jobs:
           PREVIOUS_HASH="$CURRENT_HASH"
         done
 
+    - name: Prune ros2_control to the forked package
+      run: |
+        # Only controller_manager differs from the released debs
+        cd src/ros2_control
+        find . -mindepth 1 -maxdepth 1 -type d ! -name controller_manager ! -name '.*' \
+          -exec rm -rf {} +
+        echo "Kept:"; ls
+
     - name: rosdep
       run: |
         rosdep update --rosdistro ${{ matrix.setup.rosdistro }} --include-eol-distros
@@ -83,7 +91,10 @@ jobs:
     - name: Build Local Packages
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
-        colcon build --packages-up-to ${{ env.LOCAL_PKGS }} --event-handlers console_direct+
+        # controller_manager is named explicitly: it is only a test_depend of the local
+        # packages, and --packages-up-to must not be relied on to pull it in.
+        colcon build --packages-up-to ${{ env.LOCAL_PKGS }} controller_manager \
+          --event-handlers console_direct+
 
     - name: Test Local Packages
       run: |
