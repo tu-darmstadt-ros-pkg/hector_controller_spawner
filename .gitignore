@@ -2,3 +2,11 @@
 log
 .vscode
 *cmake-build-*/
+
+# Python bytecode. Never useful to track, and colcon regenerates it under test/ on every run.
+__pycache__/
+*.py[cod]
+
+# colcon workspace output, in case the repo is built in place
+build/
+install/

@@ -1,6 +1,7 @@
 #ifndef HECTOR_CONTROLLER_SPAWNER_HECTOR_CONTROLLER_SPAWNER_HPP
 #define HECTOR_CONTROLLER_SPAWNER_HECTOR_CONTROLLER_SPAWNER_HPP
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -38,15 +39,13 @@ inline std::string vecToString( const std::vector<std::string> &vec )
 class MultiSpawner final : public rclcpp::Node
 {
 public:
-  using ControllerGroup = std::vector<std::string>; // group of controllers to activate together
-  struct ControllerChainInfo {
-    std::vector<std::string> required_controllers; // controllers that must be started before this one
-    std::vector<std::string> upper_controllers;    // controllers that can be started after this one
-  };
   explicit MultiSpawner();
   explicit MultiSpawner( const rclcpp::NodeOptions &options );
   void initialize();
-  void start_sequence( bool initial_init );
+  /// Bring hardware and controllers into the configured state.
+  /// @return true when every step succeeded. False means a step exhausted its retries or the
+  ///         context was shut down mid-sequence - the caller decides whether that is fatal.
+  bool start_sequence( bool initial_init );
   bool is_tracking_estop() const noexcept { return !estop_topic_.empty(); }
   bool estop_released_and_not_in_progress() const noexcept
   {
@@ -56,6 +55,9 @@ public:
   {
     return restart_after_estop_deactivation_;
   }
+  /// Stop offering to run the sequence again until the next e-stop release. Used after a failed
+  /// run so the main loop does not immediately retry at full speed.
+  void mark_sequence_done() noexcept { done_.store( true ); }
 
 private:
   // ----- helper structs -----
@@ -72,17 +74,20 @@ private:
   bool loadController( const std::string &name );
   bool configureController( const std::string &name );
   bool replicateParamsToCM();
-  void verifyFinalStates();
-  void parseControllerInfo( const controller_manager_msgs::srv::ListControllers_Response &resp,
-                            std::unordered_map<std::string, std::string> &current_state );
-  void checkRequiredControllersActive( const std::string &controller_name );
-  bool
-  validateDesiredControllerState( const controller_manager_msgs::srv::ListControllers_Response &resp );
-  bool activateControllers( const std::unordered_map<std::string, std::string> &current_state );
-  bool
-  deactivateAllActiveControllers( const std::unordered_map<std::string, std::string> &current_state );
-  bool loadControllerGroup( const std::vector<std::string> &to_activate,
-                            const std::vector<std::string> &to_deactivate );
+  /// @return true when every controller reached the state the configuration asks for.
+  bool verifyFinalStates();
+  /// Replace current_state with a fresh name → lifecycle state snapshot from the manager.
+  void snapshotControllerStates( std::unordered_map<std::string, std::string> &current_state );
+  /// @return true when every interface in hw_interfaces_ is reported active by the manager.
+  ///         A failed query counts as "not active" - repeating the start sequence is idempotent,
+  ///         so guessing wrong in that direction is the safe one.
+  bool hardwareInterfacesStillActive();
+  /// Run @p attempt until it succeeds, retry_delay_ apart, at most max_attempts_ times.
+  /// @return false once the attempts are exhausted or the context shuts down.
+  bool retryUntil( const std::string &what, const std::function<bool()> &attempt );
+  /// Request the switch with "FORCE_AUTO" strictness: the controller manager expands the chain
+  /// dependencies of to_activate, deactivates whatever blocks them along with everything
+  /// depending on those, and applies the result in a single update iteration.
   bool switchControllersRequest( const std::vector<std::string> &to_activate,
                                  const std::vector<std::string> &to_deactivate );
 
@@ -90,20 +95,22 @@ private:
   std::vector<std::string> hw_interfaces_;
   std::vector<std::string> controllers_;
   std::unordered_map<std::string, ControllerCfg> controller_cfg_;
-  // std::vector<ControllerGroup> controller_groups_;
-  std::unordered_map<std::string, ControllerChainInfo> controller_info_;
   double retry_delay_{ 5.0 };
   double start_delay_{ 0.0 };
   std::string estop_topic_;
   bool restart_after_estop_deactivation_{ true };
-  bool load_groups_one_by_one_{ true };
-  int service_call_timeout_ms_{ 5000 };
+  // The manager serialises load/configure/switch behind one mutex and the first load of a plugin
+  // type pays for the pluginlib scan, so a single call can take a good while on a loaded machine.
+  // Timing out early here is expensive: the request is not cancelled, so the manager may still
+  // carry it out while we go on to retry it.
+  int service_call_timeout_ms_{ 20000 };
+  int max_attempts_{ 10 };
 
   hector::ParameterSubscription retry_delay_param_sub_;
   hector::ParameterSubscription start_delay_param_sub_;
   hector::ParameterSubscription restart_after_estop_deactivation_param_sub_;
-  hector::ParameterSubscription load_groups_one_by_one_param_sub_;
   hector::ParameterSubscription service_call_timeout_ms_param_sub_;
+  hector::ParameterSubscription max_attempts_param_sub_;
 
   std::atomic<bool> in_progress_{ false };
   std::atomic<bool> done_{ false };

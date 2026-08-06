@@ -2,10 +2,15 @@
 
 The `hector_controller_orchestrator` package provides a C++ library to simplify complex controller management tasks in ROS 2 `ros2_control` systems. It specializes in handling controller switching while automatically resolving resource conflicts and dependency chains.
 
+The resolution itself is done by the controller manager: the library issues a single `switch_controller` call with the `FORCE_AUTO` strictness and lets the manager expand the chain and stop whatever is in the way.
+
+> **Requirement:** a controller manager that implements `AUTO`/`FORCE_AUTO`. Older versions accept the strictness value but silently fall back to `BEST_EFFORT`, in which case conflicting controllers are *not* deactivated.
+
 ## Key Features
 
 - **Smart Switching**: Automatically identifies and stops active controllers that conflict with requested ones.
 - **Dependency Resolution**: Handles chained controllers by ensuring that when a parent controller is stopped, its dependents are also stopped, and vice versa for starting.
+- **Atomic**: The resolved switch is applied in a single controller manager update iteration. If any controller in it cannot be switched, nothing changes state and the manager's error message is returned.
 - **Async & Sync API**: Offers both blocking (synchronous) and non-blocking (asynchronous) methods for integration into various node execution models.
 - **State Caching**: Maintains an internal cache of controller states (updated via `controller_manager/activity` or manual refresh) to minimize service call latency.
 
@@ -79,10 +84,14 @@ orchestrator->smartSwitchControllerAsync(target_controllers,
 
 ### How "Smart Switch" Works
 
-1. **Dependency Expansion**: If you request controller A, and A depends on B (chained), the orchestrator automatically adds B to the activation list.
-2. **Conflict Detection**: It checks which resources (joints/interfaces) the requested controllers need. If an currently active controller C uses any of those resources, C is marked for deactivation.
-3. **Ripple Deactivation**: If C is marked for deactivation, any controller D that depends on C is also marked for deactivation.
-4. **Topological Ordering**: The orchestrator calculates the correct sequence for stopping and starting. For example, it stops dependents *before* dependencies and starts dependencies *before* dependents.
+The library sends one `switch_controller` request with `strictness = FORCE_AUTO`. The controller manager then:
+
+1. **Dependency Expansion**: If you request controller A, and A depends on B (chained via reference *or* exported state interfaces), B is added to the activation set.
+2. **Conflict Detection**: It checks which command interfaces the activation set needs. A set that claims the same interface twice is rejected outright.
+3. **Ripple Deactivation**: Active controllers claiming a conflicting interface are deactivated, along with every controller depending on them.
+4. **Atomic Application**: The resolved switch is applied in a single update iteration, so no ordering is required from the caller.
+
+**Preconditions:** every controller in the resolved chain must already be loaded and configured (`inactive` state). `FORCE_AUTO` activates and deactivates controllers - it does not configure them. Requesting a controller whose dependency is still `unconfigured` fails with a message naming that dependency.
 
 ### Manual Controller Activation/Deactivation
 

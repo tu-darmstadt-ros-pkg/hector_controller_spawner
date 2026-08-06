@@ -11,3 +11,8 @@ repositories:
     type: git
     url: https://github.com/Joschi3/hector_testing_utils.git
     version: main
+  # TODO: move to jazzy-fix once feature/auto_and_force_auto_controller_switching is merged.
+  ros2_control:
+    type: git
+    url: https://github.com/tu-darmstadt-ros-pkg/ros2_control.git
+    version: feature/auto_and_force_auto_controller_switching
