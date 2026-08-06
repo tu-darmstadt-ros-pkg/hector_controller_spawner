@@ -1,8 +1,9 @@
 repositories:
+  # TODO: move back to jazzy once fix/package_xml is merged.
   hector_ros_controllers:
     type: git
     url: https://github.com/tu-darmstadt-ros-pkg/hector_ros_controllers.git
-    version: jazzy
+    version: fix/package_xml
   hector_ros2_utils:
     type: git
     url: https://github.com/tu-darmstadt-ros-pkg/hector_ros2_utils.git
