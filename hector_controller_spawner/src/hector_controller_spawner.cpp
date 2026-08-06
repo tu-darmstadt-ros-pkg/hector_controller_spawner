@@ -62,13 +62,6 @@ void MultiSpawner::initialize()
   ss << "  estop_topic: '" << estop_topic_ << "'\n";
   RCLCPP_DEBUG( get_logger(), "%s", ss.str().c_str() );
 
-  if ( start_delay_ > 0.0 ) {
-    RCLCPP_INFO( get_logger(), "Delaying start sequence by %.1f seconds...", start_delay_ );
-    const auto delay = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<double>( start_delay_ ) );
-    rclcpp::sleep_for( delay );
-  }
-
   // 2) Create service clients
   set_hw_state_client_ = this->create_client<controller_manager_msgs::srv::SetHardwareComponentState>(
       "controller_manager/set_hardware_component_state" );
@@ -266,8 +259,12 @@ bool MultiSpawner::start_sequence( bool initial_init )
                vecToString( to_activate ).c_str(), vecToString( to_deactivate ).c_str() );
 
   if ( !retryUntil( "Controller switch",
-                    [&] { return switchControllersRequest( to_activate, to_deactivate ); } ) )
+                    [&] { return switchControllersRequest( to_activate, to_deactivate ); } ) ) {
+    // Still dump where the controllers ended up. The switch is the step whose failure the state
+    // report actually explains - a resource conflict or an unconfigured chain dependency.
+    verifyFinalStates();
     return fail();
+  }
 
   // ===== Done =============================================================
   const bool states_as_configured = verifyFinalStates();

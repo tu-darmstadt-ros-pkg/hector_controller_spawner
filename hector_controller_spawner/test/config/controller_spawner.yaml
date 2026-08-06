@@ -6,6 +6,12 @@
     # How long to wait between retry attempts (HW + controllers).
     retry_delay: 1.0
 
+    # Bound the worst case well under the launch-test TIMEOUT of 360s:
+    # max_attempts * (2 * (2s service wait + service_call_timeout) + retry_delay) ~= 125s.
+    # A wedged controller manager has to fail the test, not run into ctest's hard timeout.
+    max_attempts: 5
+    service_call_timeout_ms: 10000
+
     # ---------- hardware interfaces (activate = always) ----------
     hardware_interfaces:
     - athena_flipper_interface
