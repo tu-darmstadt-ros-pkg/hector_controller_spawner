@@ -412,7 +412,7 @@ void ControllerOrchestrator::recursiveDeactivateControllers(
  * It internally calls the asynchronous version and waits for the result.
  * @note This is a blocking call. Do not call this from within a SingleThreadedExecutor callback.
  * @param activate_controllers List of controllers to activate.
- * @param timeout_s Timeout in seconds for the operation (default 2s).
+ * @param timeout_s Timeout in seconds for the operation (default 10s).
  * @return true if the switch operation was successful.
  */
 bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &activate_controllers,

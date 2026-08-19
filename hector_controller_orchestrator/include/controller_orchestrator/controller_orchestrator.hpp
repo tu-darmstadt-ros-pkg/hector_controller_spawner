@@ -49,11 +49,11 @@ public:
    * dependency chain that must be stopped. This call is blocking.
    *
    * @param activate_controllers List of controllers to activate.
-   * @param timeout_s Timeout in seconds for the operation (default 2s).
+   * @param timeout_s Timeout in seconds for the operation (default 10s).
    * @return true if the switch operation was successful.
    */
   bool smartSwitchController( std::vector<std::string> &activate_controllers,
-                              int timeout_s = 2 ) const;
+                              int timeout_s = 10 ) const;
 
   /**
    * @brief Asynchronous version of smartSwitchController.
@@ -74,7 +74,7 @@ public:
    * @return Vector of active controller names.
    */
   std::vector<std::string> getActiveControllerOfHardwareInterface( const std::string &hardware_interface,
-                                                                   int timeout_s = 2 ) const;
+                                                                   int timeout_s = 10 ) const;
 
   /**
    * @brief Deactivate the given list of controllers.
@@ -85,7 +85,7 @@ public:
    * @return true if the deactivation was successful.
    */
   bool deactivateControllers( const std::vector<std::string> &controllers_to_deactivate,
-                              int timeout_s = 2 ) const;
+                              int timeout_s = 10 ) const;
 
   /**
    * @brief Activate the given list of controllers.
@@ -96,7 +96,7 @@ public:
    * @return true if the activation was successful.
    */
   bool activateControllers( const std::vector<std::string> &controllers_to_activate,
-                            int timeout_s = 2 ) const;
+                            int timeout_s = 10 ) const;
 
   /**
    * @brief Unload all active controllers claiming any interface of a specific joint.
@@ -104,14 +104,14 @@ public:
    * @param timeout_s Timeout in seconds.
    * @return true if the controllers were deactivated successfully.
    */
-  bool unloadControllersOfJoint( const std::string &joint_name, int timeout_s = 2 );
+  bool unloadControllersOfJoint( const std::string &joint_name, int timeout_s = 10 );
 
   /**
    * @brief Query the controller manager and update the local state cache (blocking).
    * @param timeout_s Timeout in seconds.
    * @return true if the refresh was successful.
    */
-  bool refreshControllerStates( int timeout_s = 2 ) const;
+  bool refreshControllerStates( int timeout_s = 10 ) const;
 
   /**
    * @brief Query the controller manager and update the local state cache (asynchronous).
@@ -120,7 +120,7 @@ public:
    */
   void refreshControllerStatesAsync(
       const std::function<void( bool success, const std::string &message )> &callback,
-      int timeout_s = 2 ) const;
+      int timeout_s = 10 ) const;
   /**
    * @brief Checks if the controllers is currently active.
    * @param controller_name controller names to check
