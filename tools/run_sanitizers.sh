@@ -202,7 +202,10 @@ for mode in "${MODES[@]}"; do
 
   echo
   echo "=============================================================================="
+  # Named, because the suppression file is per DDS implementation and CI's default is not
+  # necessarily the one a workspace pins: a clean run says nothing about the other.
   echo " ${mode^^}  ->  ${build_base}"
+  echo " rmw: ${RMW_IMPLEMENTATION:-<unset, using the image default>}"
   echo "=============================================================================="
 
   if [[ ${DO_BUILD} -eq 1 ]]; then
