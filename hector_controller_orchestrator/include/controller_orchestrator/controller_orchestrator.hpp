@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
@@ -265,16 +266,45 @@ private:
       std::shared_ptr<std::vector<std::string>> controllers_to_deactivate, size_t index,
       const std::function<void( bool success, const std::string &message )> &callback ) const;
 
+  /**
+   * @brief Replace the whole state cache in one step.
+   *
+   * Takes the new map by value so the caller builds it outside the lock: the critical section is
+   * then a move rather than a clear plus one allocation per controller, and no reader can observe
+   * a half-rebuilt cache.
+   */
+  void replaceControllerStates( std::unordered_map<std::string, std::string> states ) const;
+
+  /**
+   * @brief Whether @p controller_name is cached as active.
+   * @pre controller_states_mutex_ is held.
+   *
+   * Split out from the public accessors because std::shared_lock is not recursive: a public entry
+   * point calling another would deadlock, and a name carrying the precondition is what stops
+   * someone writing that.
+   */
+  bool isActiveLocked( const std::string &controller_name ) const;
+
   rclcpp::Node::SharedPtr node_;
   std::string controller_manager_name_;
-  rclcpp::CallbackGroup::SharedPtr callback_group_;
+
+  /// Serves the activity subscription. Mutually exclusive: the callback replaces the cache
+  /// wholesale, so dispatching it to several threads at once only makes them queue on the mutex.
+  rclcpp::CallbackGroup::SharedPtr cache_callback_group_;
+  /// Serves the service clients. Reentrant by necessity - a blocking call parks one thread of this
+  /// group waiting for a response another thread of the same group has to deliver.
+  rclcpp::CallbackGroup::SharedPtr client_callback_group_;
+
   rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr list_controllers_client_;
   rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_controller_client_;
   rclcpp::Client<controller_manager_msgs::srv::ListHardwareComponents>::SharedPtr
       list_hardware_components_client_;
   rclcpp::Subscription<controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr
       activity_subscription_;
-  mutable std::mutex controller_states_mutex_;
+
+  /// Shared, because reads dominate: areControllersActive() is on the e-stop path and asks about
+  /// several controllers at once, while writes happen only when the activity topic ticks.
+  mutable std::shared_mutex controller_states_mutex_;
   mutable std::unordered_map<std::string, std::string> controller_states_;
 };
 
