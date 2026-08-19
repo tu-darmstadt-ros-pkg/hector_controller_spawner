@@ -98,7 +98,7 @@ jobs:
 
   tsan:
     name: ThreadSanitizer
-    continue-on-error: true
+    continue-on-error: true # TODO: Remove once robustness issues are resolved
     needs: build-and-test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
