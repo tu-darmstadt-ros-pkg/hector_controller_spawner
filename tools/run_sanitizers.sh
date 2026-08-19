@@ -23,14 +23,9 @@
 # cost of repeating every fixture setup. Use it to decide what is real; use the default to decide
 # whether anything changed.
 #
-#
-# One caveat when using this across repositories: every copy builds into <workspace>/build-<mode>,
-# so running two of them against the same workspace leaves both packages' results there. Each run's
-# own verdict is scoped to its own packages and stays correct, but `colcon test-result
-# --test-result-base build-tsan` afterwards aggregates whatever else is in the tree.
-# Each mode builds into its own <workspace>/build-<mode> and
-# <workspace>/install-<mode>, so a normal colcon build is never clobbered and
-# switching back needs no rebuild.
+# Each mode builds into its own <workspace>/build-<mode>-<package> tree, so a normal colcon
+# build is never clobbered, switching back needs no rebuild, and another repository's copy of
+# this script cannot reach into this one's.
 
 set -euo pipefail
 
@@ -196,8 +191,12 @@ run_isolated()
 overall_status=0
 
 for mode in "${MODES[@]}"; do
-  build_base="${WORKSPACE}/build-${mode}"
-  install_base="${WORKSPACE}/install-${mode}"
+  # Suffixed with the package, not just the mode. Several repositories carry a copy of this
+  # script; sharing one build-<mode> tree meant running another repository's copy quietly replaced
+  # the sibling packages here with instrumented ones, changing what this run measures without
+  # changing anything this repository owns.
+  build_base="${WORKSPACE}/build-${mode}-${PRIMARY_PACKAGE}"
+  install_base="${WORKSPACE}/install-${mode}-${PRIMARY_PACKAGE}"
   flags="$(flags_for "${mode}")"
 
   echo
