@@ -15,6 +15,24 @@ called_from_lib:librmw_cyclonedds_cpp.so
 called_from_lib:librmw_implementation.so
 called_from_lib:librmw.so
 called_from_lib:libddsc.so
+
+# --- Fast-DDS ---------------------------------------------------------------
+# The other RMW. CI runs whatever the ros:jazzy image defaults to (Fast-DDS) while a workspace
+# usually pins Cyclone, so both have to be covered or the job reports what a developer never sees.
+# Same two shapes as Cyclone: lock-free internals TSan cannot order, and a teardown race where the
+# DomainParticipantFactory destroys a StatusCondition while a dds.udp thread is still reading it.
+called_from_lib:librmw_fastrtps_cpp.so
+called_from_lib:librmw_fastrtps_shared_cpp.so
+called_from_lib:libfastrtps.so
+called_from_lib:libfastcdr.so
+race:eprosima
+mutex:eprosima
+# Fast-DDS assigns std::strings from its own threads. The racing frames are libstdc++ inlined into
+# the test binary with libfastrtps only further down the stack and unsymbolised, so neither
+# called_from_lib nor the eprosima namespace matches; the module name does.
+race:libfastrtps.so
+mutex:libfastrtps.so
+race:librmw_fastrtps_shared_cpp.so
 called_from_lib:librclcpp.so
 called_from_lib:librcl.so
 called_from_lib:librcutils.so
@@ -32,8 +50,11 @@ called_from_lib:libpal_statistics.so
 # the block itself is allocated and ordered inside uninstrumented rclcpp, so TSan sees the refcount
 # but not the synchronisation that established it. Named by the control block, so a race on the
 # pointed-to object is still reported by the frames that touch the object.
-race:_Sp_counted_base
-mutex:_Sp_counted_base
+# _Sp_counted rather than _Sp_counted_base: the family is _Sp_counted_base, _Sp_counted_ptr and
+# _Sp_counted_ptr_inplace, and the reports arrive from whichever one holds the object. All three
+# are the control block; a race on the pointed-to object is reported by the frames that touch it.
+race:_Sp_counted
+mutex:_Sp_counted
 
 # --- process teardown -------------------------------------------------------
 # rmw_implementation dlclose()s the DDS library while its threads still run in it, because
