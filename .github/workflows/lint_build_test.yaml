@@ -95,3 +95,81 @@ jobs:
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
         colcon test-result --verbose
+
+  tsan:
+    # A race in a mutex-guarded cache is not visible in the result of a test run: both orderings
+    # leave the same state behind, and the wrong one only shows up under load on a robot. So the
+    # suite also runs under ThreadSanitizer.
+    #
+    # Only this repository's packages are instrumented, and the same set locally - see
+    # tools/run_sanitizers.sh. Keeping the two equal is what makes a green run here mean the same
+    # thing as a green run on a developer's machine; suppressions are tuned to exactly this set.
+    name: ThreadSanitizer
+    # Not blocking yet. The subset is clean about nine runs in ten; the residual is a single
+    # intermittent report whose top frame is unsymbolised inside librclcpp.so, i.e. the same
+    # half-visible-lock class as everything in tools/sanitizers/tsan.supp rather than a defect
+    # here. Making this required before that is understood would just teach people to re-run CI.
+    continue-on-error: true
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ros:jazzy-ros-base
+    steps:
+    - name: Install Build Tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ros-dev-tools python3-vcstool
+
+    - name: Checkout Local Repo
+      uses: actions/checkout@v4
+      with:
+        path: src/${{ github.event.repository.name }}
+
+    - name: Recursive VCS Import
+      run: |
+        cd src
+        PREVIOUS_HASH=""
+        for i in {1..10}; do
+          REPOS_FILES=$(find . -name "*.repos")
+          CURRENT_HASH=$(echo "$REPOS_FILES" | sort | md5sum)
+          if [ "$CURRENT_HASH" == "$PREVIOUS_HASH" ]; then
+            break
+          fi
+          for f in $REPOS_FILES; do
+            vcs import . < "$f"
+          done
+          PREVIOUS_HASH="$CURRENT_HASH"
+        done
+
+    - name: rosdep
+      run: |
+        rosdep update --rosdistro jazzy --include-eol-distros
+        rosdep install -y --from-paths src --ignore-src --rosdistro jazzy
+
+    - name: Identify Local Packages
+      run: |
+        source /opt/ros/jazzy/setup.bash
+        PKGS=$(colcon list --names-only --base-paths src/${{ github.event.repository.name }} | tr '\n' ' ')
+        if [ -z "$PKGS" ]; then
+          echo "::error::No packages found in src/${{ github.event.repository.name }}"
+          exit 1
+        fi
+        echo "LOCAL_PKGS=$PKGS" >> $GITHUB_ENV
+
+    - name: Build Dependencies
+      # Everything except this repository's own packages, uninstrumented. The script rebuilds ours
+      # with -fsanitize=thread into a separate build tree.
+      run: |
+        source /opt/ros/jazzy/setup.bash
+        colcon build --packages-up-to $LOCAL_PKGS --packages-skip $LOCAL_PKGS \
+          --event-handlers console_direct+
+
+    - name: Build and Test under ThreadSanitizer
+      run: src/${{ github.event.repository.name }}/tools/run_sanitizers.sh tsan --preset ci
+
+    - name: Test Results
+      if: always()
+      run: |
+        source /opt/ros/jazzy/setup.bash
+        colcon test-result --verbose --test-result-base build-tsan
