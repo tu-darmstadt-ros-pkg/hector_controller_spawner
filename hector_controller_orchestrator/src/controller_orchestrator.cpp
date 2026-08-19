@@ -6,10 +6,13 @@
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <functional>
+#include <future>
 #include <lifecycle_msgs/msg/state.hpp>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <rclcpp/rclcpp.hpp>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -31,6 +34,27 @@ std::string vecToString( const std::vector<std::string> &vec )
 inline bool in( const std::vector<std::string> &vec, const std::string &item )
 {
   return std::find( vec.begin(), vec.end(), item ) != vec.end();
+}
+
+/**
+ * @brief Wait for a service response with a deadline, and drop the request if it never arrives.
+ *
+ * Never plain get(). The response is delivered by an executor thread of this node, so a caller that
+ * is itself a callback occupying the last free thread waits for something that can no longer
+ * happen - get() then blocks for the life of the process. A deadline turns that into a failed call
+ * the caller can report. The pending request has to be removed explicitly on timeout, or the client
+ * keeps it forever.
+ */
+template<typename ClientT>
+std::optional<typename ClientT::element_type::SharedResponse>
+awaitResponse( const ClientT &client, typename ClientT::element_type::FutureAndRequestId &future,
+               std::chrono::seconds timeout )
+{
+  if ( future.wait_for( timeout ) != std::future_status::ready ) {
+    client->remove_pending_request( future );
+    return std::nullopt;
+  }
+  return future.get();
 }
 
 std::string lifecycleStateLabel( const lifecycle_msgs::msg::State &state )
@@ -59,30 +83,39 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
                                                 const std::string &controller_manager_name )
     : node_( node ), controller_manager_name_( controller_manager_name )
 {
-  callback_group_ = node_->create_callback_group( rclcpp::CallbackGroupType::Reentrant );
+  // Two groups, because the clients and the subscription need opposite things. The clients need
+  // reentrancy: a blocking call parks a thread of the group waiting for a response another thread
+  // of the same group must deliver. The subscription needs the opposite - it replaces the cache
+  // wholesale, so dispatching it to several threads at once only makes them queue on the mutex.
+  client_callback_group_ = node_->create_callback_group( rclcpp::CallbackGroupType::Reentrant );
+  cache_callback_group_ =
+      node_->create_callback_group( rclcpp::CallbackGroupType::MutuallyExclusive );
 
-  list_controllers_client_ = node_->create_client<ListControllers>(
-      controller_manager_name_ + "/list_controllers", rclcpp::ServicesQoS(), callback_group_ );
-  switch_controller_client_ = node_->create_client<SwitchController>(
-      controller_manager_name_ + "/switch_controller", rclcpp::ServicesQoS(), callback_group_ );
+  list_controllers_client_ =
+      node_->create_client<ListControllers>( controller_manager_name_ + "/list_controllers",
+                                             rclcpp::ServicesQoS(), client_callback_group_ );
+  switch_controller_client_ =
+      node_->create_client<SwitchController>( controller_manager_name_ + "/switch_controller",
+                                              rclcpp::ServicesQoS(), client_callback_group_ );
   list_hardware_components_client_ =
       node_->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
           controller_manager_name_ + "/list_hardware_components", rclcpp::ServicesQoS(),
-          callback_group_ );
+          client_callback_group_ );
   rclcpp::SubscriptionOptions subscription_options;
-  subscription_options.callback_group = callback_group_;
+  subscription_options.callback_group = cache_callback_group_;
   activity_subscription_ =
       node_->create_subscription<controller_manager_msgs::msg::ControllerManagerActivity>(
           controller_manager_name_ + "/activity", rclcpp::QoS( 10 ),
-          [this]( const controller_manager_msgs::msg::ControllerManagerActivity::SharedPtr msg ) {
+          [this]( controller_manager_msgs::msg::ControllerManagerActivity::ConstSharedPtr msg ) {
             if ( !msg ) {
               return;
             }
-            std::lock_guard<std::mutex> lock( controller_states_mutex_ );
-            controller_states_.clear();
+            std::unordered_map<std::string, std::string> states;
+            states.reserve( msg->controllers.size() );
             for ( const auto &controller : msg->controllers ) {
-              controller_states_[controller.name] = lifecycleStateLabel( controller.state );
+              states.emplace( controller.name, lifecycleStateLabel( controller.state ) );
             }
+            replaceControllerStates( std::move( states ) );
           },
           subscription_options );
 }
@@ -291,12 +324,11 @@ bool ControllerOrchestrator::refreshControllerStates( int timeout_s ) const
   }
   auto list_future =
       list_controllers_client_->async_send_request( std::make_shared<ListControllers::Request>() );
-  if ( list_future.wait_for( std::chrono::seconds( timeout_s ) ) == std::future_status::timeout )
+  const auto list_resp =
+      awaitResponse( list_controllers_client_, list_future, std::chrono::seconds( timeout_s ) );
+  if ( !list_resp || !*list_resp )
     return false;
-  auto list_resp = list_future.get();
-  if ( !list_resp )
-    return false;
-  updateControllerStatesFromList( *list_resp );
+  updateControllerStatesFromList( **list_resp );
   return true;
 }
 
@@ -426,9 +458,19 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
 void ControllerOrchestrator::updateControllerStatesFromList(
     const controller_manager_msgs::srv::ListControllers_Response &res ) const
 {
-  std::lock_guard<std::mutex> lock( controller_states_mutex_ );
-  controller_states_.clear();
-  for ( const auto &ctrl : res.controller ) { controller_states_[ctrl.name] = ctrl.state; }
+  std::unordered_map<std::string, std::string> states;
+  states.reserve( res.controller.size() );
+  for ( const auto &ctrl : res.controller ) { states.emplace( ctrl.name, ctrl.state ); }
+  replaceControllerStates( std::move( states ) );
+}
+
+void ControllerOrchestrator::replaceControllerStates(
+    std::unordered_map<std::string, std::string> states ) const
+{
+  // The critical section is one move. Building the replacement outside keeps the allocations off
+  // the lock, and no reader can observe a half-rebuilt cache.
+  const std::lock_guard lock( controller_states_mutex_ );
+  controller_states_ = std::move( states );
 }
 
 /**
@@ -443,14 +485,22 @@ std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareIn
 {
   if ( !list_hardware_components_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) )
     return {};
-  auto hw_resp = list_hardware_components_client_
-                     ->async_send_request( std::make_shared<ListHardwareComponents::Request>() )
-                     .get();
-  if ( !hw_resp )
+  auto hw_future = list_hardware_components_client_->async_send_request(
+      std::make_shared<ListHardwareComponents::Request>() );
+  const auto hw_resp = awaitResponse( list_hardware_components_client_, hw_future,
+                                      std::chrono::seconds( timeout_s ) );
+  if ( !hw_resp ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "list_hardware_components did not answer within %ds. If this recurs, the calling "
+                  "executor has no thread left to deliver the response on.",
+                  timeout_s );
+    return {};
+  }
+  if ( !*hw_resp )
     return {};
 
   std::unordered_set<std::string> target_ifs;
-  for ( const auto &comp : hw_resp->component ) {
+  for ( const auto &comp : ( *hw_resp )->component ) {
     if ( comp.name == hardware_interface ) {
       for ( const auto &hw_if : comp.command_interfaces ) target_ifs.insert( hw_if.name );
       break;
@@ -461,13 +511,23 @@ std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareIn
 
   if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) )
     return {};
-  auto list_resp =
-      list_controllers_client_->async_send_request( std::make_shared<ListControllers::Request>() ).get();
-  if ( !list_resp )
+  auto list_future =
+      list_controllers_client_->async_send_request( std::make_shared<ListControllers::Request>() );
+  const auto list_resp =
+      awaitResponse( list_controllers_client_, list_future, std::chrono::seconds( timeout_s ) );
+  if ( !list_resp ) {
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "list_controllers did not answer within %ds. If this recurs, the calling executor "
+        "has no thread left to deliver the response on.",
+        timeout_s );
+    return {};
+  }
+  if ( !*list_resp )
     return {};
 
   std::vector<std::string> active_controllers;
-  for ( const auto &ctrl : list_resp->controller ) {
+  for ( const auto &ctrl : ( *list_resp )->controller ) {
     if ( ctrl.state != "active" )
       continue;
     for ( const auto &claimed : ctrl.claimed_interfaces ) {
@@ -497,10 +557,19 @@ bool ControllerOrchestrator::deactivateControllers(
   auto req = std::make_shared<SwitchController::Request>();
   req->deactivate_controllers = controllers_to_deactivate;
   req->strictness = SwitchController::Request::BEST_EFFORT;
-  auto resp = switch_controller_client_->async_send_request( req ).get();
-  if ( !resp || !resp->ok ) {
+  auto future = switch_controller_client_->async_send_request( req );
+  const auto resp =
+      awaitResponse( switch_controller_client_, future, std::chrono::seconds( timeout_s ) );
+  if ( !resp ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "Deactivate failed: switch_controller did not answer within %ds. If this recurs, "
+                  "the calling executor has no thread left to deliver the response on.",
+                  timeout_s );
+    return false;
+  }
+  if ( !*resp || !( *resp )->ok ) {
     RCLCPP_ERROR( node_->get_logger(), "Deactivate failed: %s",
-                  resp ? resp->message.c_str() : "null" );
+                  *resp ? ( *resp )->message.c_str() : "null" );
     return false;
   }
   return true;
@@ -519,9 +588,19 @@ bool ControllerOrchestrator::activateControllers(
   auto req = std::make_shared<SwitchController::Request>();
   req->activate_controllers = controllers_to_activate;
   req->strictness = SwitchController::Request::BEST_EFFORT;
-  auto resp = switch_controller_client_->async_send_request( req ).get();
-  if ( !resp || !resp->ok ) {
-    RCLCPP_ERROR( node_->get_logger(), "Activate failed: %s", resp ? resp->message.c_str() : "null" );
+  auto future = switch_controller_client_->async_send_request( req );
+  const auto resp =
+      awaitResponse( switch_controller_client_, future, std::chrono::seconds( timeout_s ) );
+  if ( !resp ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "Activate failed: switch_controller did not answer within %ds. If this recurs, "
+                  "the calling executor has no thread left to deliver the response on.",
+                  timeout_s );
+    return false;
+  }
+  if ( !*resp || !( *resp )->ok ) {
+    RCLCPP_ERROR( node_->get_logger(), "Activate failed: %s",
+                  *resp ? ( *resp )->message.c_str() : "null" );
     return false;
   }
   return true;
@@ -538,10 +617,21 @@ bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_
 {
   if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) )
     return false;
-  auto list_resp =
-      list_controllers_client_->async_send_request( std::make_shared<ListControllers::Request>() ).get();
-  if ( !list_resp )
+  auto list_future =
+      list_controllers_client_->async_send_request( std::make_shared<ListControllers::Request>() );
+  const auto list_response =
+      awaitResponse( list_controllers_client_, list_future, std::chrono::seconds( timeout_s ) );
+  if ( !list_response ) {
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "list_controllers did not answer within %ds. If this recurs, the calling executor "
+        "has no thread left to deliver the response on.",
+        timeout_s );
     return false;
+  }
+  if ( !*list_response )
+    return false;
+  const auto &list_resp = *list_response;
 
   std::vector<std::string> joint_claimers;
   for ( const auto &ctrl : list_resp->controller ) {
@@ -692,18 +782,28 @@ ControllerOrchestrator::buildControllerResourceMap(
   return resource_map;
 }
 
+bool ControllerOrchestrator::isActiveLocked( const std::string &controller_name ) const
+{
+  // find(), not a scan of every entry: this is a hash map and the question is about one key.
+  const auto it = controller_states_.find( controller_name );
+  return it != controller_states_.end() && it->second == "active";
+}
+
 bool ControllerOrchestrator::isControllerActive( const std::string &controller_name ) const
 {
-  std::lock_guard<std::mutex> lock( controller_states_mutex_ );
-  return std::any_of( controller_states_.begin(), controller_states_.end(), [&]( const auto &entry ) {
-    return entry.first == controller_name && entry.second == "active";
-  } );
+  const std::shared_lock lock( controller_states_mutex_ );
+  return isActiveLocked( controller_name );
 }
 
 bool ControllerOrchestrator::areControllersActive( const std::vector<std::string> &controller_names ) const
 {
+  // One lock for the whole question, so the answer describes a single moment. Locking per name
+  // answered each one against a different snapshot: a switch landing mid-loop could produce an
+  // answer true of no state that ever existed, and the caller acts on it by skipping a switch it
+  // needed.
+  const std::shared_lock lock( controller_states_mutex_ );
   return std::all_of( controller_names.begin(), controller_names.end(),
-                      [&]( const auto &name ) { return isControllerActive( name ); } );
+                      [this]( const std::string &name ) { return isActiveLocked( name ); } );
 }
 
 } // namespace controller_orchestrator
