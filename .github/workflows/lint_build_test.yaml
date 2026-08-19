@@ -97,18 +97,7 @@ jobs:
         colcon test-result --verbose
 
   tsan:
-    # A race in a mutex-guarded cache is not visible in the result of a test run: both orderings
-    # leave the same state behind, and the wrong one only shows up under load on a robot. So the
-    # suite also runs under ThreadSanitizer.
-    #
-    # Only this repository's packages are instrumented, and the same set locally - see
-    # tools/run_sanitizers.sh. Keeping the two equal is what makes a green run here mean the same
-    # thing as a green run on a developer's machine; suppressions are tuned to exactly this set.
     name: ThreadSanitizer
-    # Not blocking yet. The subset is clean about nine runs in ten; the residual is a single
-    # intermittent report whose top frame is unsymbolised inside librclcpp.so, i.e. the same
-    # half-visible-lock class as everything in tools/sanitizers/tsan.supp rather than a defect
-    # here. Making this required before that is understood would just teach people to re-run CI.
     continue-on-error: true
     needs: build-and-test
     runs-on: ubuntu-24.04
