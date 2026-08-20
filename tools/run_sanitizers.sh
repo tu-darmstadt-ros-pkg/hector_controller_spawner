@@ -31,8 +31,18 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUPPRESSION_DIR="${REPO_ROOT}/tools/sanitizers"
-PACKAGES=(controller_orchestrator)
-# The package whose build directory holds the test binaries.
+# Every package this repository ships is built instrumented, whether or not its own tests run:
+# the CI job builds the dependency repositories uninstrumented and skips ours, so one of ours left
+# out here exists in no install space at all and the build fails resolving it. Discovered rather
+# than listed so adding a package to the repository cannot silently reintroduce that hole.
+PACKAGES=()
+while IFS= read -r package; do
+  PACKAGES+=("${package}")
+done < <(colcon list --names-only --base-paths "${REPO_ROOT}")
+# Guarded because an empty --packages-select selects everything, which would instrument the
+# whole workspace.
+[[ ${#PACKAGES[@]} -gt 0 ]] || { echo "No packages found under ${REPO_ROOT}." >&2; exit 1; }
+# The package whose build directory holds the test binaries, and the only one whose tests run.
 PRIMARY_PACKAGE=controller_orchestrator
 
 # The tests CI runs under TSan. Kept here rather than in the workflow so the two
@@ -252,7 +262,7 @@ for mode in "${MODES[@]}"; do
   fi
 
   colcon test \
-    --packages-select "${PACKAGES[@]}" \
+    --packages-select "${PRIMARY_PACKAGE}" \
     --build-base "${build_base}" \
     --install-base "${install_base}" \
     --return-code-on-test-failure \
