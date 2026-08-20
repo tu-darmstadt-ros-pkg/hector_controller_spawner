@@ -58,7 +58,7 @@ jobs:
           fi
           echo "Processing Level $i dependencies..."
           for f in $REPOS_FILES; do
-            vcs import . < "$f"
+            vcs import . < "$f" --skip-existing
           done
           PREVIOUS_HASH="$CURRENT_HASH"
         done
@@ -95,3 +95,70 @@ jobs:
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
         colcon test-result --verbose
+
+  tsan:
+    name: ThreadSanitizer
+    continue-on-error: true # TODO: Remove once robustness issues are resolved
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ros:jazzy-ros-base
+    steps:
+    - name: Install Build Tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ros-dev-tools python3-vcstool
+
+    - name: Checkout Local Repo
+      uses: actions/checkout@v4
+      with:
+        path: src/${{ github.event.repository.name }}
+
+    - name: Recursive VCS Import
+      run: |
+        cd src
+        PREVIOUS_HASH=""
+        for i in {1..10}; do
+          REPOS_FILES=$(find . -name "*.repos")
+          CURRENT_HASH=$(echo "$REPOS_FILES" | sort | md5sum)
+          if [ "$CURRENT_HASH" == "$PREVIOUS_HASH" ]; then
+            break
+          fi
+          for f in $REPOS_FILES; do
+            vcs import . < "$f" --skip-existing
+          done
+          PREVIOUS_HASH="$CURRENT_HASH"
+        done
+
+    - name: rosdep
+      run: |
+        rosdep update --rosdistro jazzy --include-eol-distros
+        rosdep install -y --from-paths src --ignore-src --rosdistro jazzy
+
+    - name: Identify Local Packages
+      run: |
+        source /opt/ros/jazzy/setup.bash
+        PKGS=$(colcon list --names-only --base-paths src/${{ github.event.repository.name }} | tr '\n' ' ')
+        if [ -z "$PKGS" ]; then
+          echo "::error::No packages found in src/${{ github.event.repository.name }}"
+          exit 1
+        fi
+        echo "LOCAL_PKGS=$PKGS" >> $GITHUB_ENV
+
+    - name: Build Dependencies
+      # Everything except this repository's own packages, uninstrumented. The script rebuilds ours
+      # with -fsanitize=thread into a separate build tree.
+      run: |
+        source /opt/ros/jazzy/setup.bash
+        colcon build --packages-up-to $LOCAL_PKGS --packages-skip $LOCAL_PKGS \
+          --event-handlers console_direct+
+
+    - name: Build and Test under ThreadSanitizer
+      run: src/${{ github.event.repository.name }}/tools/run_sanitizers.sh tsan --preset ci
+
+    - name: Test Results
+      if: always()
+      run: |
+        source /opt/ros/jazzy/setup.bash
+        colcon test-result --verbose --test-result-base build-tsan-controller_orchestrator

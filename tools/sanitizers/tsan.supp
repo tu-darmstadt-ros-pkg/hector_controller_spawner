@@ -1,0 +1,89 @@
+# ThreadSanitizer suppressions for hector_controller_spawner.
+#
+# Only this repository is built with -fsanitize=thread; rclcpp, rmw and the DDS implementation are
+# not. TSan still sees their mutexes - it intercepts pthread at the libc level - but not their
+# atomics, and it cannot order accesses whose lock lives in an uninstrumented module. Everything
+# below is of that kind, and every entry was added against a report actually observed in this
+# configuration, not in anticipation.
+#
+# The rule for adding one: a report about this repository own state is real. Fix it.
+
+# --- rclcpp / rmw / DDS -----------------------------------------------------
+called_from_lib:librclcpp_lifecycle.so
+called_from_lib:librmw_dds_common.so
+called_from_lib:librmw_cyclonedds_cpp.so
+called_from_lib:librmw_implementation.so
+called_from_lib:librmw.so
+called_from_lib:libddsc.so
+
+# --- Fast-DDS ---------------------------------------------------------------
+# The other RMW. CI runs whatever the ros:jazzy image defaults to (Fast-DDS) while a workspace
+# usually pins Cyclone, so both have to be covered or the job reports what a developer never sees.
+# Same two shapes as Cyclone: lock-free internals TSan cannot order, and a teardown race where the
+# DomainParticipantFactory destroys a StatusCondition while a dds.udp thread is still reading it.
+called_from_lib:librmw_fastrtps_cpp.so
+called_from_lib:librmw_fastrtps_shared_cpp.so
+called_from_lib:libfastrtps.so
+called_from_lib:libfastcdr.so
+race:eprosima
+mutex:eprosima
+# Fast-DDS assigns std::strings from its own threads. The racing frames are libstdc++ inlined into
+# the test binary with libfastrtps only further down the stack and unsymbolised, so neither
+# called_from_lib nor the eprosima namespace matches; the module name does.
+race:libfastrtps.so
+mutex:libfastrtps.so
+race:librmw_fastrtps_shared_cpp.so
+called_from_lib:librclcpp.so
+called_from_lib:librcl.so
+called_from_lib:librcutils.so
+called_from_lib:librcpputils.so
+called_from_lib:libclass_loader.so
+called_from_lib:liburdf.so
+
+# --- uninstrumented ros2_control --------------------------------------------
+called_from_lib:libcontroller_manager.so
+called_from_lib:libcontroller_interface.so
+called_from_lib:libhardware_interface.so
+called_from_lib:libpal_statistics.so
+
+# libstdc++ shared_ptr control blocks are manipulated by code inlined into the test binary while
+# the block itself is allocated and ordered inside uninstrumented rclcpp, so TSan sees the refcount
+# but not the synchronisation that established it. Named by the control block, so a race on the
+# pointed-to object is still reported by the frames that touch the object.
+# _Sp_counted rather than _Sp_counted_base: the family is _Sp_counted_base, _Sp_counted_ptr and
+# _Sp_counted_ptr_inplace, and the reports arrive from whichever one holds the object. All three
+# are the control block; a race on the pointed-to object is reported by the frames that touch it.
+race:_Sp_counted
+mutex:_Sp_counted
+
+# --- process teardown -------------------------------------------------------
+# rmw_implementation dlclose()s the DDS library while its threads still run in it, because
+# rclcpp::shutdown() does not destroy the global Context. Upstream ROS 2 teardown ordering.
+race:__cxa_finalize
+race:_dl_fini
+
+# --- rclcpp service client pending-request table ----------------------------
+# The orchestrator sends service requests, so rclcpp's Client header is inlined into this
+# instrumented library while librclcpp.so holds the other half. TSan then sees the accesses to
+# pending_requests_ but not the lock ordering them, and reports the table both as a double lock and
+# as a data race. Named by the two rclcpp functions that touch it; nothing in this repository
+# defines either.
+mutex:rclcpp::Client
+mutex:get_and_erase_pending_request
+race:get_and_erase_pending_request
+race:handle_response
+
+# realtime_tools ships its own mutex type. TSan cannot model it from the uninstrumented controllers
+# that use it, and reports every unlock as unmatched.
+mutex:realtime_tools::detail::mutex
+
+# --- uninstrumented controllers and message plumbing ------------------------
+# The orchestrator's test brings up a controller manager with real controllers, none of which are
+# instrumented. Every report below named only their frames.
+called_from_lib:libjoint_state_broadcaster.so
+called_from_lib:libforward_command_controller.so
+called_from_lib:libposition_controllers.so
+called_from_lib:libvelocity_controllers.so
+called_from_lib:librosidl_runtime_c.so
+called_from_lib:libtransmission_interface.so
+called_from_lib:libhector_transmission_interface.so
