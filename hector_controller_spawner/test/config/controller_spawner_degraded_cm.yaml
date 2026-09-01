@@ -1,0 +1,16 @@
+/**:
+  ros__parameters:
+    estop_topic: estop_board/hard_estop
+
+    # Short, so a retry that does happen is visible inside the test's patience.
+    retry_delay: 1.0
+    service_call_timeout_ms: 1000
+
+    hardware_interfaces:
+    - athena_arm_interface
+
+    controllers:
+    - joint_state_broadcaster
+
+    joint_state_broadcaster:
+      activate: true

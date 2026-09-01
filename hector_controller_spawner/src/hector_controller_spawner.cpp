@@ -139,7 +139,16 @@ void MultiSpawner::start_sequence( bool initial_init )
         std::make_shared<controller_manager_msgs::srv::ListHardwareComponents::Request>() );
     if ( rclcpp::spin_until_future_complete( shared_from_this(), list_hw_fut, serviceCallTimeout() ) !=
          rclcpp::FutureReturnCode::SUCCESS ) {
-      RCLCPP_WARN( get_logger(), "Failed to list hardware components" );
+      // Nothing spins this node outside the main loop, so the answer to a call that timed out can
+      // never arrive: get() would block here for good. The attempt is abandoned instead, leaving
+      // done_ clear so the main loop starts a new one.
+      RCLCPP_WARN( get_logger(),
+                   "Failed to list hardware components. Retrying the startup sequence in %.1fs.",
+                   retry_delay_ );
+      list_hardware_ctrl_client_->remove_pending_request( list_hw_fut );
+      in_progress_ = false;
+      rclcpp::sleep_for( sleep_ns );
+      return;
     }
     auto list_hw_resp = list_hw_fut.get();
     size_t active_hw_interfaces = 0;
