@@ -56,6 +56,10 @@ public:
   {
     return restart_after_estop_deactivation_;
   }
+  /// @brief Whether any startup sequence ended without the robot in the requested state. The
+  /// process exit code carries this: best-effort switches report ok whatever they dropped, so
+  /// nothing else distinguishes a spawner that worked from one that quietly did nothing.
+  bool sequence_failed() const noexcept { return sequence_failed_; }
 
 private:
   // ----- helper structs -----
@@ -72,7 +76,12 @@ private:
   bool loadController( const std::string &name );
   bool configureController( const std::string &name );
   bool replicateParamsToCM();
-  void verifyFinalStates();
+  /// @brief Whether the controllers ended up in the state the configuration asked for.
+  bool verifyFinalStates();
+  /// @brief Replaces current_state with a fresh listing. False means the manager did not answer,
+  /// and the caller must not carry on against what it has.
+  bool refreshControllerState( std::unordered_map<std::string, std::string> &current_state,
+                               controller_manager_msgs::srv::ListControllers_Response &resp_out );
   void parseControllerInfo( const controller_manager_msgs::srv::ListControllers_Response &resp,
                             std::unordered_map<std::string, std::string> &current_state );
   void checkRequiredControllersActive( const std::string &controller_name );
@@ -109,6 +118,7 @@ private:
   std::atomic<bool> in_progress_{ false };
   std::atomic<bool> done_{ false };
   std::atomic<bool> released_{ false };
+  std::atomic<bool> sequence_failed_{ false };
 
   std::chrono::milliseconds serviceCallTimeout() const
   {

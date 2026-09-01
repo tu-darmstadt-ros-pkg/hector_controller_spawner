@@ -25,7 +25,11 @@ int main( int argc, char **argv )
     std::this_thread::sleep_for( 50ms );
   }
 
+  // A startup sequence that could not put the robot into the requested state says so here. The
+  // switch requests are best effort and report ok whatever the manager dropped, so without this
+  // the process exits successfully having activated nothing.
+  const bool failed = node->sequence_failed();
   node.reset();
   rclcpp::shutdown();
-  return 0;
+  return failed ? 1 : 0;
 }
