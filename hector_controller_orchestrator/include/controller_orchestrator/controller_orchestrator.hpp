@@ -1,6 +1,7 @@
 #ifndef CONTROLLER_ORCHESTRATOR_CONTROLLER_ORCHESTRATOR_HPP
 #define CONTROLLER_ORCHESTRATOR_CONTROLLER_ORCHESTRATOR_HPP
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -248,7 +249,8 @@ private:
    */
   void recursiveActivateControllers(
       std::shared_ptr<std::vector<std::string>> controllers_to_activate, size_t index,
-      const std::function<void( bool success, const std::string &message )> &callback ) const;
+      const std::function<void( bool success, const std::string &message )> &callback,
+      uint64_t generation ) const;
 
   /**
    * @brief Recursively deactivates controllers in reverse order, then activates.
@@ -264,7 +266,8 @@ private:
   void recursiveDeactivateControllers(
       std::shared_ptr<std::vector<std::string>> controllers_to_activate,
       std::shared_ptr<std::vector<std::string>> controllers_to_deactivate, size_t index,
-      const std::function<void( bool success, const std::string &message )> &callback ) const;
+      const std::function<void( bool success, const std::string &message )> &callback,
+      uint64_t generation ) const;
 
   /**
    * @brief Replace the whole state cache in one step.
@@ -306,6 +309,16 @@ private:
   /// several controllers at once, while writes happen only when the activity topic ticks.
   mutable std::shared_mutex controller_states_mutex_;
   mutable std::unordered_map<std::string, std::string> controller_states_;
+
+  /// Held by every async callback as a weak reference. The callbacks capture this, and a response
+  /// that arrives after the orchestrator is gone would otherwise run against freed memory.
+  /// Destroyed with the object, which is what makes the weak reference expire.
+  std::shared_ptr<int> alive_token_{ std::make_shared<int>( 0 ) };
+
+  /// Bumped by every new switch request. A chain whose caller has given up - the synchronous
+  /// wrapper times out and returns, but the chain is still armed - stops instead of resuming
+  /// minutes later against a robot that has moved on.
+  mutable std::atomic<uint64_t> switch_generation_{ 0 };
 };
 
 } // namespace controller_orchestrator

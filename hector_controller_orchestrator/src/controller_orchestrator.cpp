@@ -148,9 +148,18 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
     return;
   }
 
+  // Claims the controllers for this request. A chain still running for an earlier one stops at its
+  // next step rather than switching controllers its caller stopped waiting for.
+  const uint64_t generation = ++switch_generation_;
+
   auto list_req = std::make_shared<ListControllers::Request>();
   list_controllers_client_->async_send_request(
-      list_req, [=]( rclcpp::Client<ListControllers>::SharedFuture list_future ) {
+      list_req, [=, alive = std::weak_ptr<int>( alive_token_ )](
+                    rclcpp::Client<ListControllers>::SharedFuture list_future ) {
+        if ( alive.expired() )
+          return;
+        if ( generation != switch_generation_.load() )
+          return;
         const auto list_resp = list_future.get();
         if ( !list_resp ) {
           callback( false, "list_controllers returned null response" );
@@ -185,10 +194,10 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
         if ( !to_deactivate->empty() ) {
           // Deactivation: Head -> Tail (Topo)
           // Start deactivation process, which will trigger activation once finished.
-          recursiveDeactivateControllers( to_activate, to_deactivate, 0, callback );
+          recursiveDeactivateControllers( to_activate, to_deactivate, 0, callback, generation );
         } else {
           // No deactivations needed, start activation directly.
-          recursiveActivateControllers( to_activate, 0, callback );
+          recursiveActivateControllers( to_activate, 0, callback, generation );
         }
       } );
 }
@@ -362,7 +371,8 @@ void ControllerOrchestrator::refreshControllerStatesAsync(
 
 void ControllerOrchestrator::recursiveActivateControllers(
     std::shared_ptr<std::vector<std::string>> controllers_to_activate, size_t index,
-    const std::function<void( bool success, const std::string &message )> &callback ) const
+    const std::function<void( bool success, const std::string &message )> &callback,
+    uint64_t generation ) const
 {
   if ( !controllers_to_activate || index >= controllers_to_activate->size() ) {
     callback( true, "Activation chain complete" );
@@ -372,37 +382,47 @@ void ControllerOrchestrator::recursiveActivateControllers(
   req->activate_controllers = { ( *controllers_to_activate )[index] };
   req->strictness = SwitchController::Request::BEST_EFFORT;
   switch_controller_client_->async_send_request(
-      req, [this, controllers_to_activate, index,
-            callback]( rclcpp::Client<SwitchController>::SharedFuture f ) {
+      req, [this, alive = std::weak_ptr<int>( alive_token_ ), generation, controllers_to_activate,
+            index, callback]( rclcpp::Client<SwitchController>::SharedFuture f ) {
+        if ( alive.expired() )
+          return; // the orchestrator is gone, and so is everything this would touch
+        if ( generation != switch_generation_.load() )
+          return; // a newer request owns the controllers now
         if ( !f.get() || !f.get()->ok ) {
           callback( false, "Failed to activate " + ( *controllers_to_activate )[index] );
           return;
         }
-        recursiveActivateControllers( controllers_to_activate, index + 1, callback );
+        recursiveActivateControllers( controllers_to_activate, index + 1, callback, generation );
       } );
 }
 
 void ControllerOrchestrator::recursiveDeactivateControllers(
     std::shared_ptr<std::vector<std::string>> controllers_to_activate,
     std::shared_ptr<std::vector<std::string>> controllers_to_deactivate, size_t index,
-    const std::function<void( bool success, const std::string &message )> &callback ) const
+    const std::function<void( bool success, const std::string &message )> &callback,
+    uint64_t generation ) const
 {
   if ( !controllers_to_deactivate || index >= controllers_to_deactivate->size() ) {
-    recursiveActivateControllers( controllers_to_activate, 0, callback );
+    recursiveActivateControllers( controllers_to_activate, 0, callback, generation );
     return;
   }
   auto req = std::make_shared<SwitchController::Request>();
   req->deactivate_controllers = { ( *controllers_to_deactivate )[index] };
   req->strictness = SwitchController::Request::BEST_EFFORT;
   switch_controller_client_->async_send_request(
-      req, [this, controllers_to_activate, controllers_to_deactivate, index,
+      req, [this, alive = std::weak_ptr<int>( alive_token_ ), generation, controllers_to_activate,
+            controllers_to_deactivate, index,
             callback]( rclcpp::Client<SwitchController>::SharedFuture f ) {
+        if ( alive.expired() )
+          return;
+        if ( generation != switch_generation_.load() )
+          return;
         if ( !f.get() || !f.get()->ok ) {
           callback( false, "Failed to deactivate " + ( *controllers_to_deactivate )[index] );
           return;
         }
         recursiveDeactivateControllers( controllers_to_activate, controllers_to_deactivate,
-                                        index + 1, callback );
+                                        index + 1, callback, generation );
       } );
 }
 
@@ -533,11 +553,18 @@ std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareIn
       continue;
     for ( const auto &claimed : ctrl.claimed_interfaces ) {
       for ( const auto &target : target_ifs ) {
-        if ( claimed.size() >= target.size() &&
-             claimed.compare( claimed.size() - target.size(), target.size(), target ) == 0 ) {
-          active_controllers.push_back( ctrl.name );
-          goto next_ctrl;
-        }
+        if ( claimed.size() < target.size() )
+          continue;
+        const size_t offset = claimed.size() - target.size();
+        if ( claimed.compare( offset, target.size(), target ) != 0 )
+          continue;
+        // A chained controller's interface carries a prefix, so the match is a suffix. It has to
+        // end on a name boundary all the same: without this, target "arm_joint/velocity" matches a
+        // claimed "farm_joint/velocity" and the wrong controller is deactivated.
+        if ( offset != 0 && claimed[offset - 1] != '/' )
+          continue;
+        active_controllers.push_back( ctrl.name );
+        goto next_ctrl;
       }
     }
   next_ctrl:;
@@ -767,6 +794,15 @@ std::vector<std::string> ControllerOrchestrator::topologicalSortControllers(
         }
       }
     }
+  }
+  if ( sorted.size() != active_controllers.size() ) {
+    // A cycle leaves controllers with a standing indegree, and returning the partial order drops
+    // them from the switch without a word: they stay in whatever state they were in.
+    RCLCPP_ERROR( node_->get_logger(),
+                  "The controller chain contains a cycle: %zu of %zu controllers could not be "
+                  "ordered. Refusing to switch.",
+                  active_controllers.size() - sorted.size(), active_controllers.size() );
+    return {};
   }
   return sorted;
 }
