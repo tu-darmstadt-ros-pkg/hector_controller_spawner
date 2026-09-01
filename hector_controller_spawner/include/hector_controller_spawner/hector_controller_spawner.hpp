@@ -72,6 +72,9 @@ private:
   void estopCb( const std_msgs::msg::Bool::SharedPtr msg );
 
   // ----- helpers -----
+  /// @brief Whether the e-stop is engaged again, which makes going on with a startup sequence
+  /// work against whatever drove the hardware down.
+  bool abortRequested() const;
   bool loadAndActivateHardware( const std::string &name );
   bool loadController( const std::string &name );
   bool configureController( const std::string &name );
@@ -119,6 +122,9 @@ private:
   std::atomic<bool> done_{ false };
   std::atomic<bool> released_{ false };
   std::atomic<bool> sequence_failed_{ false };
+  /// Set when a press lands while a sequence runs. The release that follows cannot clear done_
+  /// from the callback, and a depth-1 subscription has nothing left to redeliver.
+  std::atomic<bool> estop_pressed_during_sequence_{ false };
 
   std::chrono::milliseconds serviceCallTimeout() const
   {

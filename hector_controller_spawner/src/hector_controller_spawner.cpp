@@ -41,6 +41,17 @@ void MultiSpawner::initialize()
       shared_from_this(), "service_call_timeout_ms", std::ref( service_call_timeout_ms_ ),
       "Service call timeout in milliseconds",
       hector::ParameterOptions<int>().onValidate( []( const auto &value ) { return value > 0; } ) );
+  // An override under a name nothing declares is dropped without a word, so a configuration that
+  // sets the timeout under the old name runs on the default and reads as if it had not.
+  for ( const auto &override : this->get_node_options().parameter_overrides() ) {
+    if ( override.get_name() == "srv_call_timeout_ms" ) {
+      RCLCPP_ERROR( get_logger(),
+                    "Parameter 'srv_call_timeout_ms' does not exist and is being ignored. The "
+                    "service call timeout is 'service_call_timeout_ms' (an integer, milliseconds); "
+                    "running with %d ms.",
+                    service_call_timeout_ms_ );
+    }
+  }
   for ( const auto &ctrl : controllers_ ) {
     ControllerCfg cfg;
     cfg.activate = this->declare_parameter<bool>( ctrl + ".activate", true );
@@ -97,18 +108,41 @@ void MultiSpawner::initialize()
   }
 }
 
+bool MultiSpawner::abortRequested() const
+{
+  // Only when the e-stop is tracked: without a topic, released_ is set once and never changes.
+  return is_tracking_estop() && !released_;
+}
+
 void MultiSpawner::estopCb( const std_msgs::msg::Bool::SharedPtr msg )
 {
-  if ( !in_progress_ && !msg->data ) {
-    RCLCPP_INFO( get_logger(), "E‑stop released — commencing startup sequence." );
+  const bool released = !msg->data;
+  const bool was_released = released_.exchange( released );
+  if ( released == was_released ) {
+    // The e-stop board publishes its state, not its changes, so most messages say what the last
+    // one said. Acting on every one of them restarts the sequence forever.
+    return;
+  }
+
+  if ( !released ) {
+    // A press that lands while a sequence is running has to survive it: the sequence is bringing
+    // hardware up against an e-stop that is now engaged, and the release that follows is the only
+    // thing that would have restarted it.
+    estop_pressed_during_sequence_ = in_progress_.load();
+    RCLCPP_INFO( get_logger(), "E-stop engaged." );
+    return;
+  }
+
+  RCLCPP_INFO( get_logger(), "E‑stop released — commencing startup sequence." );
+  if ( !in_progress_ ) {
     done_ = false;
   }
-  released_ = !msg->data;
 }
 
 void MultiSpawner::start_sequence( bool initial_init )
 {
   in_progress_ = true;
+  estop_pressed_during_sequence_ = false;
 
   const auto sleep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>( retry_delay_ ) );
@@ -166,6 +200,14 @@ void MultiSpawner::start_sequence( bool initial_init )
   // ===== Hardware =========================================================
   for ( const auto &hw : hw_interfaces_ ) {
     while ( rclcpp::ok() ) {
+      if ( abortRequested() ) {
+        RCLCPP_WARN( get_logger(),
+                     "E-stop engaged while activating hardware '%s'. Abandoning this startup "
+                     "sequence.",
+                     hw.c_str() );
+        in_progress_ = false;
+        return;
+      }
       if ( loadAndActivateHardware( hw ) ) {
         RCLCPP_DEBUG( get_logger(), "Hardware '%s' is active.", hw.c_str() );
         break;
@@ -174,6 +216,13 @@ void MultiSpawner::start_sequence( bool initial_init )
                    retry_delay_ );
       rclcpp::sleep_for( sleep_ns );
     }
+  }
+  if ( abortRequested() ) {
+    RCLCPP_WARN( get_logger(),
+                 "E-stop engaged before the controllers were started. Abandoning this startup "
+                 "sequence." );
+    in_progress_ = false;
+    return;
   }
 
   // ===== Controllers ======================================================
@@ -230,6 +279,13 @@ void MultiSpawner::start_sequence( bool initial_init )
   // 2) Load missing controllers (one service call per controller) ----------
   for ( const auto &name : to_load ) {
     while ( rclcpp::ok() ) {
+      if ( abortRequested() ) {
+        RCLCPP_WARN( get_logger(),
+                     "E-stop engaged while trying to load '%s'. Abandoning this startup sequence.",
+                     name.c_str() );
+        in_progress_ = false;
+        return;
+      }
       if ( loadController( name ) ) {
         RCLCPP_INFO( get_logger(), "Controller '%s' loaded.", name.c_str() );
         break;
@@ -243,6 +299,14 @@ void MultiSpawner::start_sequence( bool initial_init )
   // 2.5) Configure missing controllers
   for ( const auto &name : to_load ) {
     while ( rclcpp::ok() ) {
+      if ( abortRequested() ) {
+        RCLCPP_WARN(
+            get_logger(),
+            "E-stop engaged while trying to configure '%s'. Abandoning this startup sequence.",
+            name.c_str() );
+        in_progress_ = false;
+        return;
+      }
       if ( configureController( name ) ) {
         RCLCPP_INFO( get_logger(), "Controller '%s' configured.", name.c_str() );
         break;
@@ -309,6 +373,15 @@ void MultiSpawner::start_sequence( bool initial_init )
   RCLCPP_INFO( get_logger(), " Multi Controller Spawner complete – shutting down." );
   done_.store( true );
   in_progress_ = false;
+  // A press and release that both landed while this ran left released_ true with done_ now set,
+  // and the depth-1 subscription has nothing left to redeliver. Without this the robot stays down
+  // after an e-stop cycle nobody saw.
+  if ( estop_pressed_during_sequence_ && released_ ) {
+    RCLCPP_INFO( get_logger(),
+                 "The e-stop was engaged and released while the sequence ran. Starting it again." );
+    estop_pressed_during_sequence_ = false;
+    done_ = false;
+  }
 }
 
 bool MultiSpawner::refreshControllerState(

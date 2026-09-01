@@ -93,8 +93,14 @@ class TestSpawnerSurvivesUnansweredCall(unittest.TestCase):
     def test_unanswered_list_does_not_wedge_the_sequence(
         self, proc_output, spawner_node
     ):
-        # An e-stop cycle drives the restart path, which is the one that asks for the hardware
-        # components. The fake manager receives that request and never answers it.
+        # The first sequence has to finish before an e-stop cycle can drive the restart path, which
+        # is the one that asks for the hardware components. The fake manager receives that request
+        # and never answers it.
+        self._publish_estop(False)
+        proc_output.assertWaitFor(
+            "Multi Controller Spawner complete", process=spawner_node, timeout=30
+        )
+
         self._publish_estop(True)
         rclpy.spin_once(self.node, timeout_sec=1.0)
         self._publish_estop(False)
