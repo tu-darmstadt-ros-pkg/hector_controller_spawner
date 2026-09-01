@@ -140,6 +140,7 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
   // optimization: skip if all requested controllers are already cached as active
   if ( areControllersActive( activate_controllers ) ) {
     callback( true, "Controller are already active. If not call refreshControllerStates." );
+    return;
   }
 
   if ( !list_controllers_client_->service_is_ready() ) {

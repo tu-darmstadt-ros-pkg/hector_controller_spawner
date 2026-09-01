@@ -693,20 +693,31 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActiveAsync )
 
   this->activity_sub_->reset();
   std::atomic<bool> callback_done{ false };
+  // Counted, not flagged: the already-active shortcut answers the caller and the full switch
+  // pipeline runs behind it, so a second answer overwrites the first. A caller that holds a promise
+  // sets it twice and throws inside an executor callback.
+  std::atomic<int> callback_calls{ 0 };
   bool async_success = false;
   std::string async_message;
 
   this->orchestrator_->smartSwitchControllerAsync(
-      requested,
-      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
+      requested, [&callback_done, &callback_calls, &async_success,
+                  &async_message]( bool success, const std::string &message ) {
         async_success = success;
         async_message = message;
+        ++callback_calls;
         callback_done = true;
       } );
 
   ASSERT_TRUE(
       this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
   ASSERT_TRUE( async_success ) << async_message;
+
+  // Waits for a second answer rather than sampling once: the switch pipeline behind the shortcut
+  // needs a service round trip to reach its own callback.
+  EXPECT_FALSE(
+      this->executor_->spin_until( [&callback_calls]() { return callback_calls.load() > 1; }, 2s ) )
+      << "The completion callback was invoked more than once for one request";
 
   const auto after_resp = this->list_controllers();
   ASSERT_NE( after_resp, nullptr );
