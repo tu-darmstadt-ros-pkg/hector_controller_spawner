@@ -1,0 +1,18 @@
+/**:
+  ros__parameters:
+    # No e-stop topic on purpose: the sequence runs once, unprompted, and every retry has to happen
+    # without a release to trigger it.
+    estop_topic: ''
+
+    # Short, so a retry that does happen is visible inside the test's patience.
+    retry_delay: 1.0
+    service_call_timeout_ms: 1000
+
+    hardware_interfaces:
+    - athena_arm_interface
+
+    controllers:
+    - joint_state_broadcaster
+
+    joint_state_broadcaster:
+      activate: true

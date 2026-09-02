@@ -8,6 +8,9 @@ the same list. Tests drive those states from here.
 
 Parameters:
   never_answer      list of service base names that receive the request and never reply
+  stall_first       list of service base names whose FIRST call is answered only after
+                    stall_first_sec, i.e. after a caller with a shorter timeout gave up
+  stall_first_sec   how long that first call is held
   answer_delay_sec  seconds to stall every service before replying
   drop_first_list   answer the first list_controllers call with nothing at all
   foreign_active    controllers reported active that no spawner config names
@@ -45,6 +48,8 @@ class FakeControllerManager(Node):
         self.never_answer = self.declare_parameter(
             "never_answer", [], string_array
         ).value
+        self.stall_first = self.declare_parameter("stall_first", [], string_array).value
+        self.stall_first_sec = self.declare_parameter("stall_first_sec", 3.0).value
         self.answer_delay_sec = self.declare_parameter("answer_delay_sec", 0.0).value
         self.drop_first_list = self.declare_parameter("drop_first_list", False).value
         self.foreign_active = self.declare_parameter(
@@ -60,6 +65,7 @@ class FakeControllerManager(Node):
         # name -> state string, seeded with the controllers no spawner config knows about
         self._controllers = {name: "active" for name in self.foreign_active}
         self._stalled = []  # keeps never-answered requests alive
+        self._stalled_once = set()  # service names whose first call has been swallowed
 
         self.create_service(
             ListHardwareComponents,
@@ -91,6 +97,18 @@ class FakeControllerManager(Node):
         if service_name in self.never_answer:
             self.get_logger().warn(f"swallowing a {service_name} request")
             return False
+        with self._lock:
+            first_call = (
+                service_name in self.stall_first
+                and service_name not in self._stalled_once
+            )
+            if first_call:
+                self._stalled_once.add(service_name)
+        if first_call:
+            # Answered, but only after the caller's own timeout has passed. Blocking for good
+            # instead would wedge the node: every service here shares one callback group.
+            self.get_logger().warn(f"stalling the first {service_name} request")
+            threading.Event().wait(self.stall_first_sec)
         if self.answer_delay_sec > 0.0:
             threading.Event().wait(self.answer_delay_sec)
         return True

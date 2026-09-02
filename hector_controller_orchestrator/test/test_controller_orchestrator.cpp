@@ -134,6 +134,9 @@ protected:
     // wait until the multi-spawner has loaded and started the controllers
     // if this fails, likely the spawner node failed to not the orchestrator
     ASSERT_TRUE( wait_for_activity( expected_initial_states(), 30s ) );
+    // The states can be reached before the sequence returns, and it deactivates and reactivates
+    // controllers on its way out. A test starting in that window switches against a moving target.
+    ASSERT_TRUE( executor_->spin_until( [this]() { return spawner_finished_.load(); }, 30s ) );
   }
 
   void TearDown() override
@@ -365,8 +368,13 @@ protected:
                                                std::vector<std::string>{ controllers_yaml_ } );
     spawner_node_ = std::make_shared<hector_controller_spawner::MultiSpawner>( spawner_options );
     spawner_node_->initialize();
-    spawner_node_->start_sequence( true );
     executor_->add_node( spawner_node_ );
+    // The sequence blocks on its service calls, and the executor holding this node has to stay free
+    // to deliver the responses.
+    spawner_thread_ = std::thread( [this]() {
+      spawner_node_->start_sequence();
+      spawner_finished_ = true;
+    } );
     return true;
   }
 
@@ -374,6 +382,14 @@ protected:
   {
     if ( !spawner_node_ ) {
       return;
+    }
+    if ( spawner_thread_.joinable() ) {
+      // Its service calls are answered by this executor, and nothing else spins it here. Joining
+      // straight away against a sequence still in one of its retry loops would never return.
+      if ( !executor_->spin_until( [this]() { return spawner_finished_.load(); }, 15s ) ) {
+        rclcpp::shutdown(); // ends the sequence's `while ( rclcpp::ok() )` loops
+      }
+      spawner_thread_.join();
     }
     spawner_node_.reset();
   }
@@ -406,6 +422,8 @@ protected:
 
   std::shared_ptr<controller_orchestrator::ControllerOrchestrator> orchestrator_;
   std::shared_ptr<hector_controller_spawner::MultiSpawner> spawner_node_;
+  std::thread spawner_thread_;
+  std::atomic<bool> spawner_finished_{ false };
   std::shared_ptr<hector_testing_utils::TestSubscription<ControllerManagerActivity>> activity_sub_;
   std::shared_ptr<hector_testing_utils::TestClient<ListControllers>> list_client_;
 
@@ -665,7 +683,11 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActive )
 
   this->activity_sub_->reset();
   auto to_activate = requested;
-  const bool switch_success = this->orchestrator_->smartSwitchController( to_activate, 10 );
+  // Spun while it blocks, like every other synchronous call here: the answer comes from a listing
+  // the executor has to deliver, including when it turns out there is nothing to switch.
+  const bool switch_success = spin_while_executing( *this->executor_, [this, &to_activate]() {
+    return this->orchestrator_->smartSwitchController( to_activate, 10 );
+  } );
   ASSERT_TRUE( switch_success );
 
   const auto after_resp = this->list_controllers();

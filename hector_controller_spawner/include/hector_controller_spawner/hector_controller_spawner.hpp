@@ -1,6 +1,7 @@
 #ifndef HECTOR_CONTROLLER_SPAWNER_HECTOR_CONTROLLER_SPAWNER_HPP
 #define HECTOR_CONTROLLER_SPAWNER_HECTOR_CONTROLLER_SPAWNER_HPP
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -31,9 +32,20 @@ inline std::string vecToString( const std::vector<std::string> &vec )
   return result;
 }
 
+/// @brief How a startup sequence ended, which decides whether it runs again.
+enum class SequenceOutcome : uint8_t {
+  Completed, ///< The controller phase ran and left the robot in the requested state.
+  Failed,    ///< It ran and did not, and running the same sequence again cannot change that.
+  Abandoned, ///< The attempt stopped early. Nothing was decided, so it has to run again.
+};
+
 /**
  *  @brief  Multispawner waits for an (optional) e‑stop, then loads & activates
  *          hardware interfaces followed by controllers .
+ *
+ *  The sequence blocks on service calls, so it must run on its own thread while an executor spins
+ *  the node. Without that the e-stop subscription is only served between calls, and the sequence
+ *  brings hardware up against a press it has not been told about yet.
  */
 class MultiSpawner final : public rclcpp::Node
 {
@@ -46,12 +58,10 @@ public:
   explicit MultiSpawner();
   explicit MultiSpawner( const rclcpp::NodeOptions &options );
   void initialize();
-  void start_sequence( bool initial_init );
+  SequenceOutcome start_sequence();
   bool is_tracking_estop() const noexcept { return !estop_topic_.empty(); }
-  bool estop_released_and_not_in_progress() const noexcept
-  {
-    return released_ && !in_progress_ && !done_;
-  }
+  /// @brief Whether the e-stop allows a sequence and one is still wanted.
+  bool ready_to_start() const noexcept { return released_ && run_requested_; }
   bool restart_after_estop_deactivation() const noexcept
   {
     return restart_after_estop_deactivation_;
@@ -79,8 +89,9 @@ private:
   bool loadController( const std::string &name );
   bool configureController( const std::string &name );
   bool replicateParamsToCM();
-  /// @brief Whether the controllers ended up in the state the configuration asked for.
-  bool verifyFinalStates();
+  /// @brief Whether the controllers ended up in the state the configuration asked for, or nothing
+  /// if the manager did not answer. Not knowing is not the same as knowing they are wrong.
+  std::optional<bool> verifyFinalStates();
   /// @brief Replaces current_state with a fresh listing. False means the manager did not answer,
   /// and the caller must not carry on against what it has.
   bool refreshControllerState( std::unordered_map<std::string, std::string> &current_state,
@@ -105,12 +116,21 @@ private:
   std::unordered_map<std::string, ControllerCfg> controller_cfg_;
   // std::vector<ControllerGroup> controller_groups_;
   std::unordered_map<std::string, ControllerChainInfo> controller_info_;
-  double retry_delay_{ 5.0 };
-  double start_delay_{ 0.0 };
+  // Written by the parameter callbacks, which run on the executor thread while the sequence runs
+  // on its own. Atomic so a value changing mid-sequence is a race the language defines.
+  std::atomic<double> retry_delay_{ 5.0 };
+  double start_delay_{ 0.0 }; // read once, during initialize()
   std::string estop_topic_;
-  bool restart_after_estop_deactivation_{ true };
-  bool load_groups_one_by_one_{ true };
-  int service_call_timeout_ms_{ 5000 };
+  std::atomic<bool> restart_after_estop_deactivation_{ true };
+  std::atomic<bool> load_groups_one_by_one_{ true };
+  std::atomic<int> service_call_timeout_ms_{ 5000 };
+
+  /// The plain values the reconfigurable-parameter helper owns and writes. Mirrored into the
+  /// atomics above by its update callback, which is the only thing that reads them.
+  double retry_delay_value_{ 5.0 };
+  bool restart_after_estop_deactivation_value_{ true };
+  bool load_groups_one_by_one_value_{ true };
+  int service_call_timeout_ms_value_{ 5000 };
 
   hector::ParameterSubscription retry_delay_param_sub_;
   hector::ParameterSubscription start_delay_param_sub_;
@@ -118,13 +138,21 @@ private:
   hector::ParameterSubscription load_groups_one_by_one_param_sub_;
   hector::ParameterSubscription service_call_timeout_ms_param_sub_;
 
-  std::atomic<bool> in_progress_{ false };
-  std::atomic<bool> done_{ false };
+  /// Cleared when a sequence starts and set again by an e-stop release, so a release that lands
+  /// while a sequence runs still asks for the next one.
+  std::atomic<bool> run_requested_{ true };
   std::atomic<bool> released_{ false };
   std::atomic<bool> sequence_failed_{ false };
-  /// Set when a press lands while a sequence runs. The release that follows cannot clear done_
-  /// from the callback, and a depth-1 subscription has nothing left to redeliver.
-  std::atomic<bool> estop_pressed_during_sequence_{ false };
+  /// Whether a sequence has ever finished and verified its controller phase. The restart shortcut
+  /// needs this: hardware left active by an attempt that was abandoned before the controllers is
+  /// not a robot that has nothing left to do.
+  bool controllers_started_{ false };
+
+  /// Attempts abandoned back to back. A failure that repeats is not a busy manager, and retrying
+  /// it forever leaves whatever waits for this process waiting for good. Reset by an e-stop
+  /// release, which runs on the executor thread.
+  std::atomic<int> consecutive_abandoned_{ 0 };
+  static constexpr int MAX_CONSECUTIVE_ABANDONED = 10;
 
   std::chrono::milliseconds serviceCallTimeout() const
   {
