@@ -4,6 +4,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -27,7 +28,7 @@ namespace controller_orchestrator
  * - Async/Sync operations: Provides both blocking and non-blocking interfaces for common tasks.
  * - State caching: Maintains a local cache of controller states for faster access.
  */
-class ControllerOrchestrator
+class ControllerOrchestrator : public std::enable_shared_from_this<ControllerOrchestrator>
 {
   using ListControllers = controller_manager_msgs::srv::ListControllers;
   using SwitchController = controller_manager_msgs::srv::SwitchController;
@@ -42,6 +43,10 @@ public:
   explicit ControllerOrchestrator(
       const rclcpp::Node::SharedPtr &node,
       const std::string &controller_manager_name = "controller_manager" );
+
+  /// Drops the subscription and the clients first. Declared before the cache and its mutex, they
+  /// would otherwise be destroyed last and go on feeding callbacks into state that is already gone.
+  ~ControllerOrchestrator();
 
   /**
    * @brief Tries to activate the given controllers, deactivating all conflicting controllers.
@@ -62,11 +67,12 @@ public:
    * Analyzes dependencies and conflicts, then performs the switch operation non-blockingly.
    *
    * @param activate_controllers List of controllers to activate.
-   * @param callback Function to call upon completion with (success, message).
+   * @param callback Function to call upon completion with (success, message). Invoked exactly once,
+   *        including when a newer request takes the controllers over before this chain finishes.
+   * @param claimed_generation_out Optional: the generation this request claimed, so a caller that
+   *        gives up can retire its own chain without touching one that has since superseded it.
+   *        Left untouched when the request answered without starting a chain.
    */
-  /// @param claimed_generation_out Optional: the generation this request claimed, so a caller that
-  ///        gives up can retire its own chain without touching one that has since superseded it.
-  ///        Left untouched when the request answered without starting a chain.
   void smartSwitchControllerAsync(
       const std::vector<std::string> &activate_controllers,
       const std::function<void( bool success, const std::string &message )> &callback,
@@ -200,9 +206,10 @@ private:
    *
    * @param active_controllers Set of active controllers to sort
    * @param forward_connections Forward chain connection map (use buildChainConnectionMaps to create)
-   * @return Topologically sorted list of controllers, or empty vector if cycle detected
+   * @return Topologically sorted list of controllers, or nothing if a cycle makes the order
+   *         undefinable. An empty list is a valid answer meaning there was nothing to sort.
    */
-  std::vector<std::string> topologicalSortControllers(
+  std::optional<std::vector<std::string>> topologicalSortControllers(
       const std::unordered_set<std::string> &active_controllers,
       const std::unordered_map<std::string, std::vector<std::string>> &forward_connections ) const;
 
@@ -313,11 +320,6 @@ private:
   /// several controllers at once, while writes happen only when the activity topic ticks.
   mutable std::shared_mutex controller_states_mutex_;
   mutable std::unordered_map<std::string, std::string> controller_states_;
-
-  /// Held by every async callback as a weak reference. The callbacks capture this, and a response
-  /// that arrives after the orchestrator is gone would otherwise run against freed memory.
-  /// Destroyed with the object, which is what makes the weak reference expire.
-  std::shared_ptr<int> alive_token_{ std::make_shared<int>( 0 ) };
 
   /// Bumped by every new switch request. A chain whose caller has given up - the synchronous
   /// wrapper times out and returns, but the chain is still armed - stops instead of resuming

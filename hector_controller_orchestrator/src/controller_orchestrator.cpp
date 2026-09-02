@@ -120,6 +120,19 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
           subscription_options );
 }
 
+ControllerOrchestrator::~ControllerOrchestrator()
+{
+  // The activity callback is created in the constructor, where weak_from_this() is still empty, so
+  // it captures the orchestrator directly. Dropping the subscription here stops the executor
+  // picking up further messages, which narrows the window but does not close it: a dispatch already
+  // under way holds its own reference to the subscription and will run against a freed cache.
+  // Closing that needs the subscription created after construction, from a factory.
+  activity_subscription_.reset();
+  list_controllers_client_.reset();
+  switch_controller_client_.reset();
+  list_hardware_components_client_.reset();
+}
+
 /**
  * @brief Asynchronous implementation of the smart switch logic.
  *
@@ -138,12 +151,10 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
     return;
   }
 
-  // optimization: skip if all requested controllers are already cached as active
-  if ( areControllersActive( activate_controllers ) ) {
-    callback( true, "Controller are already active. If not call refreshControllerStates." );
-    return;
-  }
-
+  // No shortcut on the cache here. It is fed by the activity topic and by list responses with no
+  // ordering between them, and a chain in flight is about to change the very states it holds, so
+  // "already active" can be a claim about a moment that has passed. The listing below is one round
+  // trip and answers the same question about now.
   if ( !list_controllers_client_->service_is_ready() ) {
     callback( false, "list_controllers service not ready" );
     return;
@@ -158,12 +169,19 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
 
   auto list_req = std::make_shared<ListControllers::Request>();
   list_controllers_client_->async_send_request(
-      list_req, [=, alive = std::weak_ptr<int>( alive_token_ )](
-                    rclcpp::Client<ListControllers>::SharedFuture list_future ) {
-        if ( alive.expired() )
+      list_req,
+      [=, self = weak_from_this()]( rclcpp::Client<ListControllers>::SharedFuture list_future ) {
+        // Locked, not merely tested: holding the orchestrator alive for the body is what stops a
+        // destructor running to completion on another thread halfway through it.
+        const auto locked = self.lock();
+        if ( !locked )
           return;
-        if ( generation != switch_generation_.load() )
+        if ( generation != switch_generation_.load() ) {
+          // A newer request owns the controllers. The caller still has to be told, or it waits
+          // out its whole timeout for an answer that was never coming.
+          callback( false, "superseded by a newer switch request" );
           return;
+        }
         const auto list_resp = list_future.get();
         if ( !list_resp ) {
           callback( false, "list_controllers returned null response" );
@@ -241,12 +259,26 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
 
   // 3. Filter valid requests
   std::vector<std::string> valid_requests;
+  std::vector<std::string> unknown_requests;
   for ( const auto &req : to_activate ) {
     if ( in( available_controllers, req ) ) {
       valid_requests.push_back( req );
     } else {
-      RCLCPP_WARN( node_->get_logger(), "Requested controller '%s' not found.", req.c_str() );
+      unknown_requests.push_back( req );
     }
+  }
+  if ( !unknown_requests.empty() ) {
+    RCLCPP_WARN( node_->get_logger(), "The controller manager does not hold: %s",
+                 vecToString( unknown_requests ).c_str() );
+  }
+  // Nothing the manager holds was asked for, so there is no switch to make. Answering success for
+  // that reports a robot in a state nobody arranged, which is what an empty listing after a manager
+  // restart used to produce. A request only partly available still switches what it can, since
+  // refusing it outright would drop the controllers that were there.
+  if ( valid_requests.empty() ) {
+    RCLCPP_ERROR( node_->get_logger(), "None of the requested controllers exist: %s",
+                  vecToString( unknown_requests ).c_str() );
+    return false;
   }
 
   // 4. Expand Activation Set (Downstream Dependencies Only)
@@ -315,8 +347,14 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
 
   // 8. Topological Sort (Head -> Tail)
   // Ensures that controllers are returned in an order that satisfies dependency constraints.
-  to_activate = topologicalSortControllers( final_activation_set, forward_chain );
-  to_deactivate = topologicalSortControllers( final_deactivation_set, forward_chain );
+  const auto sorted_activation = topologicalSortControllers( final_activation_set, forward_chain );
+  const auto sorted_deactivation =
+      topologicalSortControllers( final_deactivation_set, forward_chain );
+  if ( !sorted_activation || !sorted_deactivation ) {
+    return false;
+  }
+  to_activate = *sorted_activation;
+  to_deactivate = *sorted_deactivation;
 
   RCLCPP_DEBUG( node_->get_logger(), "Analysis: Activating [%s], Deactivating [%s]",
                 vecToString( to_activate ).c_str(), vecToString( to_deactivate ).c_str() );
@@ -362,9 +400,10 @@ void ControllerOrchestrator::refreshControllerStatesAsync(
 
   auto list_req = std::make_shared<ListControllers::Request>();
   list_controllers_client_->async_send_request(
-      list_req, [this, callback, alive = std::weak_ptr<int>( alive_token_ )](
+      list_req, [this, callback, self = weak_from_this()](
                     rclcpp::Client<ListControllers>::SharedFuture list_future ) {
-        if ( alive.expired() )
+        const auto locked = self.lock();
+        if ( !locked )
           return;
         const auto list_resp = list_future.get();
         if ( !list_resp ) {
@@ -387,14 +426,21 @@ void ControllerOrchestrator::recursiveActivateControllers(
   }
   auto req = std::make_shared<SwitchController::Request>();
   req->activate_controllers = { ( *controllers_to_activate )[index] };
+  // Best effort, deliberately. The plan comes from one listing while the chain sends a request per
+  // controller, so by a later step the snapshot can be seconds old. Strict refuses a controller
+  // that has since become active, and refusing aborts the chain partway, leaving the joint with
+  // the deactivations applied and none of the activations.
   req->strictness = SwitchController::Request::BEST_EFFORT;
   switch_controller_client_->async_send_request(
-      req, [this, alive = std::weak_ptr<int>( alive_token_ ), generation, controllers_to_activate,
-            index, callback]( rclcpp::Client<SwitchController>::SharedFuture f ) {
-        if ( alive.expired() )
+      req, [this, self = weak_from_this(), generation, controllers_to_activate, index,
+            callback]( rclcpp::Client<SwitchController>::SharedFuture f ) {
+        const auto locked = self.lock();
+        if ( !locked )
           return; // the orchestrator is gone, and so is everything this would touch
-        if ( generation != switch_generation_.load() )
-          return; // a newer request owns the controllers now
+        if ( generation != switch_generation_.load() ) {
+          callback( false, "superseded by a newer switch request" );
+          return;
+        }
         if ( !f.get() || !f.get()->ok ) {
           callback( false, "Failed to activate " + ( *controllers_to_activate )[index] );
           return;
@@ -417,13 +463,16 @@ void ControllerOrchestrator::recursiveDeactivateControllers(
   req->deactivate_controllers = { ( *controllers_to_deactivate )[index] };
   req->strictness = SwitchController::Request::BEST_EFFORT;
   switch_controller_client_->async_send_request(
-      req, [this, alive = std::weak_ptr<int>( alive_token_ ), generation, controllers_to_activate,
+      req, [this, self = weak_from_this(), generation, controllers_to_activate,
             controllers_to_deactivate, index,
             callback]( rclcpp::Client<SwitchController>::SharedFuture f ) {
-        if ( alive.expired() )
+        const auto locked = self.lock();
+        if ( !locked )
           return;
-        if ( generation != switch_generation_.load() )
+        if ( generation != switch_generation_.load() ) {
+          callback( false, "superseded by a newer switch request" );
           return;
+        }
         if ( !f.get() || !f.get()->ok ) {
           callback( false, "Failed to deactivate " + ( *controllers_to_deactivate )[index] );
           return;
@@ -447,14 +496,6 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
                                                     int timeout_s ) const
 {
   // Safety Check: Avoid running this directly inside a SingleThreadedExecutor callback
-
-  // if controllers already active do nothing
-  if ( areControllersActive( activate_controllers ) ) {
-    RCLCPP_INFO( node_->get_logger(), "[ControllerOrchestrator] Controllers are already active. If "
-                                      "not call refreshControllerStates." );
-    return true;
-  }
-
   auto promise = std::make_shared<std::promise<std::pair<bool, std::string>>>();
   auto future = promise->get_future();
 
@@ -473,9 +514,12 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
   if ( status == std::future_status::timeout ) {
     // Retires the chain this call started, so a response arriving later stops instead of switching
     // controllers nobody is waiting for. Only if it is still the current one: a newer request has
-    // taken the controllers over already, and invalidating that would strand its caller.
-    uint64_t expected = claimed_generation;
-    switch_generation_.compare_exchange_strong( expected, claimed_generation + 1 );
+    // taken the controllers over already, and invalidating that would strand its caller. Zero means
+    // no chain was ever claimed, and bumping from it would retire the next request instead.
+    if ( claimed_generation != 0 ) {
+      uint64_t expected = claimed_generation;
+      switch_generation_.compare_exchange_strong( expected, claimed_generation + 1 );
+    }
     RCLCPP_ERROR( node_->get_logger(),
                   "[ControllerOrchestrator] Synchronous Switch Timed Out after %d seconds. "
                   "Likely Cause: The ROS Executor is not spinning to process the response.",
@@ -705,8 +749,12 @@ bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_
   }
 
   // Deactivate: Head -> Tail
-  auto sorted = topologicalSortControllers( { to_deactivate.begin(), to_deactivate.end() }, fwd );
-  return deactivateControllers( sorted, timeout_s );
+  const auto sorted =
+      topologicalSortControllers( { to_deactivate.begin(), to_deactivate.end() }, fwd );
+  if ( !sorted ) {
+    return false;
+  }
+  return deactivateControllers( *sorted, timeout_s );
 }
 
 void ControllerOrchestrator::buildChainConnectionMaps(
@@ -774,12 +822,12 @@ std::unordered_set<std::string> ControllerOrchestrator::getUpstreamDependents(
   return visited;
 }
 
-std::vector<std::string> ControllerOrchestrator::topologicalSortControllers(
+std::optional<std::vector<std::string>> ControllerOrchestrator::topologicalSortControllers(
     const std::unordered_set<std::string> &active_controllers,
     const std::unordered_map<std::string, std::vector<std::string>> &forward_connections ) const
 {
   if ( active_controllers.empty() )
-    return {};
+    return std::vector<std::string>{}; // nothing to sort, which is an order, not a refusal
   std::unordered_map<std::string, size_t> indegree;
   for ( const auto &name : active_controllers ) indegree[name] = 0;
   for ( const auto &pair : forward_connections ) {
@@ -812,12 +860,13 @@ std::vector<std::string> ControllerOrchestrator::topologicalSortControllers(
   }
   if ( sorted.size() != active_controllers.size() ) {
     // A cycle leaves controllers with a standing indegree, and returning the partial order drops
-    // them from the switch without a word: they stay in whatever state they were in.
+    // them from the switch without a word: they stay in whatever state they were in. Empty would
+    // be read as "nothing to do", which is the same silence one level up.
     RCLCPP_ERROR( node_->get_logger(),
                   "The controller chain contains a cycle: %zu of %zu controllers could not be "
                   "ordered. Refusing to switch.",
                   active_controllers.size() - sorted.size(), active_controllers.size() );
-    return {};
+    return std::nullopt;
   }
   return sorted;
 }
