@@ -97,6 +97,12 @@ if(BUILD_TESTING)
     realtime_tools::realtime_tools
     rclcpp::rclcpp
     ${std_msgs_TARGETS})
+
+  ament_add_gtest(stale_switch_chain_test test/test_stale_switch_chain.cpp
+                  TIMEOUT 120)
+  target_link_libraries(
+    stale_switch_chain_test ${PROJECT_NAME} ${controller_manager_msgs_TARGETS}
+    hector_testing_utils::hector_testing_utils rclcpp::rclcpp)
 endif()
 
 ament_package()

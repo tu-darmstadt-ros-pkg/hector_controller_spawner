@@ -64,9 +64,13 @@ public:
    * @param activate_controllers List of controllers to activate.
    * @param callback Function to call upon completion with (success, message).
    */
+  /// @param claimed_generation_out Optional: the generation this request claimed, so a caller that
+  ///        gives up can retire its own chain without touching one that has since superseded it.
+  ///        Left untouched when the request answered without starting a chain.
   void smartSwitchControllerAsync(
       const std::vector<std::string> &activate_controllers,
-      const std::function<void( bool success, const std::string &message )> &callback ) const;
+      const std::function<void( bool success, const std::string &message )> &callback,
+      uint64_t *claimed_generation_out = nullptr ) const;
 
   /**
    * @brief Get a list of currently active controllers that claim a specific hardware interface.

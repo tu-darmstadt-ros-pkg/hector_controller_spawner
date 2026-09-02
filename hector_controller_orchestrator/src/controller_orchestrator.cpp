@@ -130,7 +130,8 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
  */
 void ControllerOrchestrator::smartSwitchControllerAsync(
     const std::vector<std::string> &activate_controllers,
-    const std::function<void( bool success, const std::string &message )> &callback ) const
+    const std::function<void( bool success, const std::string &message )> &callback,
+    uint64_t *claimed_generation_out ) const
 {
   if ( activate_controllers.empty() ) {
     callback( true, "No controllers requested" );
@@ -151,6 +152,9 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
   // Claims the controllers for this request. A chain still running for an earlier one stops at its
   // next step rather than switching controllers its caller stopped waiting for.
   const uint64_t generation = ++switch_generation_;
+  if ( claimed_generation_out != nullptr ) {
+    *claimed_generation_out = generation;
+  }
 
   auto list_req = std::make_shared<ListControllers::Request>();
   list_controllers_client_->async_send_request(
@@ -358,7 +362,10 @@ void ControllerOrchestrator::refreshControllerStatesAsync(
 
   auto list_req = std::make_shared<ListControllers::Request>();
   list_controllers_client_->async_send_request(
-      list_req, [this, callback]( rclcpp::Client<ListControllers>::SharedFuture list_future ) {
+      list_req, [this, callback, alive = std::weak_ptr<int>( alive_token_ )](
+                    rclcpp::Client<ListControllers>::SharedFuture list_future ) {
+        if ( alive.expired() )
+          return;
         const auto list_resp = list_future.get();
         if ( !list_resp ) {
           callback( false, "list_controllers returned null response" );
@@ -452,15 +459,23 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
   auto future = promise->get_future();
 
   // Call the Async version, but bind the result to our promise
-  smartSwitchControllerAsync( activate_controllers,
-                              [promise]( bool success, const std::string &message ) {
-                                promise->set_value( { success, message } );
-                              } );
+  uint64_t claimed_generation = 0;
+  smartSwitchControllerAsync(
+      activate_controllers,
+      [promise]( bool success, const std::string &message ) {
+        promise->set_value( { success, message } );
+      },
+      &claimed_generation );
 
   // Wait for the result (Blocking)
   auto status = future.wait_for( std::chrono::seconds( timeout_s ) );
 
   if ( status == std::future_status::timeout ) {
+    // Retires the chain this call started, so a response arriving later stops instead of switching
+    // controllers nobody is waiting for. Only if it is still the current one: a newer request has
+    // taken the controllers over already, and invalidating that would strand its caller.
+    uint64_t expected = claimed_generation;
+    switch_generation_.compare_exchange_strong( expected, claimed_generation + 1 );
     RCLCPP_ERROR( node_->get_logger(),
                   "[ControllerOrchestrator] Synchronous Switch Timed Out after %d seconds. "
                   "Likely Cause: The ROS Executor is not spinning to process the response.",
