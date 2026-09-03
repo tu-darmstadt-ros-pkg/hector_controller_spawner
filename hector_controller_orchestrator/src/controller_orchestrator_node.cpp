@@ -17,8 +17,8 @@ int main( int argc, char **argv )
 
   // 3) Instantiate the ControllerOrchestrator, pointing to your controller_manager
   //    (replace "/athena/controller_manager" if your namespace is different)
-  auto orchestrator = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
-      node, "/athena/controller_manager" );
+  auto orchestrator =
+      controller_orchestrator::ControllerOrchestrator::create( node, "/athena/controller_manager" );
 
   // 4) Set up a one‐shot timer to invoke smartSwitchController after ~1 second
   rclcpp::TimerBase::SharedPtr timer =

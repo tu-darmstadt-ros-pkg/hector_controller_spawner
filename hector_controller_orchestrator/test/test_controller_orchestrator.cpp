@@ -126,7 +126,7 @@ protected:
 
     ASSERT_TRUE( list_client_->wait_for_service( *executor_, 10s ) );
 
-    orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
+    orchestrator_ = controller_orchestrator::ControllerOrchestrator::create(
         tester_node_, "/controller_manager" );
 
     ASSERT_TRUE( start_spawner_node() );
@@ -662,6 +662,20 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsync )
       EXPECT_EQ( after_states.at( pair.first ), "active" );
     }
   }
+}
+
+TYPED_TEST( ControllerOrchestratorTypedFixture, AnOrchestratorBuiltAfterBringUpKnowsTheStates )
+{
+  // The manager latches its activity topic and publishes only when something changes, so an
+  // orchestrator created once the robot is already up gets one retained sample or nothing at all.
+  // Without it every cached answer is "not active" for controllers that have been running for
+  // hours, and the caller cannot tell that from a real answer.
+  auto late = controller_orchestrator::ControllerOrchestrator::create( this->tester_node_,
+                                                                       "/controller_manager" );
+  EXPECT_TRUE( this->executor_->spin_until(
+      [&late]() { return late->isControllerActive( "flipper_velocity_controller" ); }, 10s ) )
+      << "A late orchestrator never learned that a running controller was active.";
+  late.reset();
 }
 
 TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActive )

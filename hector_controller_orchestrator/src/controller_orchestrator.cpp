@@ -79,7 +79,19 @@ std::string lifecycleStateLabel( const lifecycle_msgs::msg::State &state )
 using ListControllers = controller_manager_msgs::srv::ListControllers;
 using SwitchController = controller_manager_msgs::srv::SwitchController;
 
-ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &node,
+std::shared_ptr<ControllerOrchestrator>
+ControllerOrchestrator::create( const rclcpp::Node::SharedPtr &node,
+                                const std::string &controller_manager_name )
+{
+  auto orchestrator =
+      std::make_shared<ControllerOrchestrator>( OwnedBySharedPtr{}, node, controller_manager_name );
+  // Only now is weak_from_this() valid, which is why the subscription is not made in the
+  // constructor: its callback writes the cache and has to stop if the orchestrator is gone.
+  orchestrator->subscribeToActivity();
+  return orchestrator;
+}
+
+ControllerOrchestrator::ControllerOrchestrator( OwnedBySharedPtr, const rclcpp::Node::SharedPtr &node,
                                                 const std::string &controller_manager_name )
     : node_( node ), controller_manager_name_( controller_manager_name )
 {
@@ -101,13 +113,22 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
       node_->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
           controller_manager_name_ + "/list_hardware_components", rclcpp::ServicesQoS(),
           client_callback_group_ );
+}
+
+void ControllerOrchestrator::subscribeToActivity()
+{
   rclcpp::SubscriptionOptions subscription_options;
   subscription_options.callback_group = cache_callback_group_;
   activity_subscription_ =
       node_->create_subscription<controller_manager_msgs::msg::ControllerManagerActivity>(
-          controller_manager_name_ + "/activity", rclcpp::QoS( 10 ),
-          [this]( controller_manager_msgs::msg::ControllerManagerActivity::ConstSharedPtr msg ) {
-            if ( !msg ) {
+          // Transient local to match the manager, which latches this topic and publishes it only
+          // when something changes. A volatile subscription discards the retained sample, so an
+          // orchestrator built after bring-up would hold an empty cache until the next switch.
+          controller_manager_name_ + "/activity", rclcpp::QoS( 10 ).transient_local(),
+          [this, self = weak_from_this()](
+              controller_manager_msgs::msg::ControllerManagerActivity::ConstSharedPtr msg ) {
+            const auto locked = self.lock();
+            if ( !locked || !msg ) {
               return;
             }
             std::unordered_map<std::string, std::string> states;
@@ -122,11 +143,8 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
 
 ControllerOrchestrator::~ControllerOrchestrator()
 {
-  // The activity callback is created in the constructor, where weak_from_this() is still empty, so
-  // it captures the orchestrator directly. Dropping the subscription here stops the executor
-  // picking up further messages, which narrows the window but does not close it: a dispatch already
-  // under way holds its own reference to the subscription and will run against a freed cache.
-  // Closing that needs the subscription created after construction, from a factory.
+  // Dropped before the cache they write into, which is declared after them and so would otherwise
+  // outlive them. The callbacks themselves hold a weak reference and stop on their own.
   activity_subscription_.reset();
   list_controllers_client_.reset();
   switch_controller_client_.reset();
@@ -258,17 +276,24 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   }
 
   // 3. Filter valid requests
+  // Held and inactive, not merely held. The manager drops an unconfigured controller from a
+  // best-effort switch and answers ok for the empty request that is left, so asking for one reads
+  // as a switch that succeeded while the joint stays with whatever controller had it.
   std::vector<std::string> valid_requests;
   std::vector<std::string> unknown_requests;
   for ( const auto &req : to_activate ) {
-    if ( in( available_controllers, req ) ) {
+    const auto state = std::find_if( res.controller.begin(), res.controller.end(),
+                                     [&req]( const auto &c ) { return c.name == req; } );
+    if ( state != res.controller.end() &&
+         ( state->state == "inactive" || state->state == "active" ) ) {
       valid_requests.push_back( req );
     } else {
       unknown_requests.push_back( req );
     }
   }
   if ( !unknown_requests.empty() ) {
-    RCLCPP_WARN( node_->get_logger(), "The controller manager does not hold: %s",
+    RCLCPP_WARN( node_->get_logger(),
+                 "Not held by the manager, or not configured, so not activatable: %s",
                  vecToString( unknown_requests ).c_str() );
   }
   // Nothing the manager holds was asked for, so there is no switch to make. Answering success for
@@ -276,7 +301,9 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   // restart used to produce. A request only partly available still switches what it can, since
   // refusing it outright would drop the controllers that were there.
   if ( valid_requests.empty() ) {
-    RCLCPP_ERROR( node_->get_logger(), "None of the requested controllers exist: %s",
+    RCLCPP_ERROR( node_->get_logger(),
+                  "None of the requested controllers can be activated (not held by the manager, or "
+                  "not configured): %s",
                   vecToString( unknown_requests ).c_str() );
     return false;
   }

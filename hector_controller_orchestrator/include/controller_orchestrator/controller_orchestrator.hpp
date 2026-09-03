@@ -34,15 +34,31 @@ class ControllerOrchestrator : public std::enable_shared_from_this<ControllerOrc
   using SwitchController = controller_manager_msgs::srv::SwitchController;
   using ListHardwareComponents = controller_manager_msgs::srv::ListHardwareComponents;
 
+private:
+  /// Lets make_shared reach the constructor without opening it to everyone else.
+  struct OwnedBySharedPtr {
+    explicit OwnedBySharedPtr() = default;
+  };
+
 public:
   /**
    * @brief Construct a new Controller Orchestrator object.
+   *
+   * Only reachable through create(). Every async callback holds a weak reference to this object and
+   * does nothing if it cannot be locked, so one that is not owned by a shared_ptr would answer no
+   * caller and time out every blocking call while blaming the executor.
+   */
+  ControllerOrchestrator( OwnedBySharedPtr, const rclcpp::Node::SharedPtr &node,
+                          const std::string &controller_manager_name );
+
+  /**
+   * @brief Build an orchestrator.
    * @param node Shared pointer to the parent node.
    * @param controller_manager_name Name of the controller manager node (default: "controller_manager").
    */
-  explicit ControllerOrchestrator(
-      const rclcpp::Node::SharedPtr &node,
-      const std::string &controller_manager_name = "controller_manager" );
+  static std::shared_ptr<ControllerOrchestrator>
+  create( const rclcpp::Node::SharedPtr &node,
+          const std::string &controller_manager_name = "controller_manager" );
 
   /// Drops the subscription and the clients first. Declared before the cache and its mutex, they
   /// would otherwise be destroyed last and go on feeding callbacks into state that is already gone.
@@ -147,6 +163,10 @@ public:
   bool areControllersActive( const std::vector<std::string> &controller_names ) const;
 
 private:
+  /// @brief Subscribe to the manager's activity topic. Called by create(), where weak_from_this()
+  /// is valid; it is not inside the constructor.
+  void subscribeToActivity();
+
   // ============================================================================
   // State Management
   // ============================================================================

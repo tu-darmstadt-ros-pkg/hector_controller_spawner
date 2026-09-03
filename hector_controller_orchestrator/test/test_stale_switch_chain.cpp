@@ -60,8 +60,8 @@ protected:
     fake_cm_executor_->add_node( fake_cm_node_ );
     fake_cm_thread_ = std::thread( [this]() { fake_cm_executor_->spin(); } );
 
-    orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>( tester_node_,
-                                                                                       "/fake_cm" );
+    orchestrator_ =
+        controller_orchestrator::ControllerOrchestrator::create( tester_node_, "/fake_cm" );
   }
 
   void TearDown() override
