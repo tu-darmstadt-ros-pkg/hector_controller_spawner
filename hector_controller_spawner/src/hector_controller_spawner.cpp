@@ -22,36 +22,26 @@ void MultiSpawner::initialize()
       this->declare_parameter<std::vector<std::string>>( "controllers", std::vector<std::string>() );
   controller_param_files_ = this->declare_parameter<std::vector<std::string>>(
       "controller_param_files", std::vector<std::string>() );
-  retry_delay_param_sub_ = hector::createReconfigurableParameter(
-      shared_from_this(), "retry_delay", std::ref( retry_delay_value_ ), "Retry delay in seconds",
-      hector::ParameterOptions<double>()
-          .onValidate( []( const auto &value ) { return value > 0.0; } )
-          .onUpdate( [this]( const double &value ) { retry_delay_ = value; } ) );
-  retry_delay_ = retry_delay_value_;
-  start_delay_param_sub_ = hector::createReconfigurableParameter(
-      shared_from_this(), "start_delay", std::ref( start_delay_ ), "Start delay in seconds",
-      hector::ParameterOptions<double>().onValidate(
-          []( const auto &value ) { return value >= 0.0; } ) );
+  // Read once. These size the bring-up sequence, which is launch configuration, and the sequence
+  // runs on its own thread while the executor serves callbacks: a value changing underneath it
+  // would be a data race for no benefit anyone asked for.
+  retry_delay_ = this->declare_parameter<double>( "retry_delay", 5.0 );
+  if ( !( retry_delay_ > 0.0 ) ) {
+    RCLCPP_WARN( get_logger(), "retry_delay must be positive; using 5.0s instead of %.1f.",
+                 retry_delay_ );
+    retry_delay_ = 5.0;
+  }
+  start_delay_ = this->declare_parameter<double>( "start_delay", 0.0 );
   estop_topic_ = this->declare_parameter<std::string>( "estop_topic", "" );
-  restart_after_estop_deactivation_param_sub_ = hector::createReconfigurableParameter(
-      shared_from_this(), "restart_after_estop_deactivation",
-      std::ref( restart_after_estop_deactivation_value_ ), "Restart after e-stop deactivation",
-      hector::ParameterOptions<bool>().onUpdate(
-          [this]( const bool &value ) { restart_after_estop_deactivation_ = value; } ) );
-  restart_after_estop_deactivation_ = restart_after_estop_deactivation_value_;
-  load_groups_one_by_one_param_sub_ = hector::createReconfigurableParameter(
-      shared_from_this(), "load_groups_one_by_one", std::ref( load_groups_one_by_one_value_ ),
-      "Load controller groups one by one",
-      hector::ParameterOptions<bool>().onUpdate(
-          [this]( const bool &value ) { load_groups_one_by_one_ = value; } ) );
-  load_groups_one_by_one_ = load_groups_one_by_one_value_;
-  service_call_timeout_ms_param_sub_ = hector::createReconfigurableParameter(
-      shared_from_this(), "service_call_timeout_ms", std::ref( service_call_timeout_ms_value_ ),
-      "Service call timeout in milliseconds",
-      hector::ParameterOptions<int>()
-          .onValidate( []( const auto &value ) { return value > 0; } )
-          .onUpdate( [this]( const int &value ) { service_call_timeout_ms_ = value; } ) );
-  service_call_timeout_ms_ = service_call_timeout_ms_value_;
+  restart_after_estop_deactivation_ =
+      this->declare_parameter<bool>( "restart_after_estop_deactivation", true );
+  load_groups_one_by_one_ = this->declare_parameter<bool>( "load_groups_one_by_one", true );
+  service_call_timeout_ms_ = this->declare_parameter<int>( "service_call_timeout_ms", 5000 );
+  if ( service_call_timeout_ms_ <= 0 ) {
+    RCLCPP_WARN( get_logger(), "service_call_timeout_ms must be positive; using 5000 instead of %d.",
+                 service_call_timeout_ms_ );
+    service_call_timeout_ms_ = 5000;
+  }
   // An override under a name nothing declares is dropped without a word, so a configuration that
   // sets the timeout under the old name runs on the default and reads as if it had not.
   for ( const auto &override : this->get_node_options().parameter_overrides() ) {
@@ -60,7 +50,7 @@ void MultiSpawner::initialize()
                     "Parameter 'srv_call_timeout_ms' does not exist and is being ignored. The "
                     "service call timeout is 'service_call_timeout_ms' (an integer, milliseconds); "
                     "running with %d ms.",
-                    service_call_timeout_ms_.load() );
+                    service_call_timeout_ms_ );
     }
   }
   for ( const auto &ctrl : controllers_ ) {
@@ -101,9 +91,6 @@ void MultiSpawner::initialize()
       "controller_manager/list_controllers" );
   configure_ctrl_client_ = this->create_client<controller_manager_msgs::srv::ConfigureController>(
       "controller_manager/configure_controller" );
-  list_hardware_ctrl_client_ =
-      this->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
-          "controller_manager/list_hardware_components" );
   cm_param_client_ =
       std::make_shared<rclcpp::AsyncParametersClient>( shared_from_this(), "controller_manager" );
 
@@ -173,66 +160,36 @@ SequenceOutcome MultiSpawner::start_sequence()
 
   // ===== Controller Manager Availability =================================
   while ( rclcpp::ok() && !list_ctrl_client_->wait_for_service( sleep_ns ) ) {
-    RCLCPP_WARN( get_logger(), "Controller Manager is not yet available %.1fs", retry_delay_.load() );
+    RCLCPP_WARN( get_logger(), "Controller Manager is not yet available %.1fs", retry_delay_ );
   }
 
   // ===== Copy Parameters ==================================================
-  // Before the controllers are loaded for the first time, so they come up with their parameters.
-  if ( !controllers_started_ && !replicateParamsToCM() ) {
+  // Every attempt, before anything is loaded: setting the same values again is harmless, and a
+  // manager restarted since the last attempt has lost them.
+  if ( !replicateParamsToCM() ) {
     RCLCPP_ERROR( get_logger(), "Failed to replicate controller parameters to controller_manager "
                                 "- controllers may fail to initialize." );
   }
 
-  // ===== Restart Necessary ?  ==============================================
-  // Only once the controllers have been through a full sequence. Hardware left active by an
-  // attempt that never reached them says nothing about whether they are running.
-  if ( controllers_started_ ) {
-    auto list_hw_fut = list_hardware_ctrl_client_->async_send_request(
-        std::make_shared<controller_manager_msgs::srv::ListHardwareComponents::Request>() );
-    if ( list_hw_fut.wait_for( serviceCallTimeout() ) != std::future_status::ready ) {
+  // ===== Hardware =========================================================
+  // One attempt each. Re-running the whole sequence is the retry: it re-reads what is already up
+  // and only acts on what is not, so a per-phase loop would be a second retry mechanism outside
+  // the attempt count that bounds this one.
+  for ( const auto &hw : hw_interfaces_ ) {
+    if ( abortRequested() ) {
       RCLCPP_WARN( get_logger(),
-                   "Failed to list hardware components. Retrying the startup sequence in %.1fs.",
-                   retry_delay_.load() );
-      list_hardware_ctrl_client_->remove_pending_request( list_hw_fut );
+                   "E-stop engaged while activating hardware '%s'. Abandoning this startup "
+                   "sequence.",
+                   hw.c_str() );
+      return abandon();
+    }
+    if ( !loadAndActivateHardware( hw ) ) {
+      RCLCPP_WARN( get_logger(), "Hardware '%s' failed – retrying the sequence in %.1fs",
+                   hw.c_str(), retry_delay_ );
       rclcpp::sleep_for( sleep_ns );
       return abandon();
     }
-    auto list_hw_resp = list_hw_fut.get();
-    size_t active_hw_interfaces = 0;
-    for ( const auto &hw : list_hw_resp->component ) {
-      if ( hw.state.id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE &&
-           std::find( hw_interfaces_.begin(), hw_interfaces_.end(), hw.name ) !=
-               hw_interfaces_.end() ) {
-        active_hw_interfaces++;
-      }
-    }
-    if ( active_hw_interfaces == hw_interfaces_.size() ) {
-      RCLCPP_INFO( get_logger(),
-                   "Hardware interfaces are still available after e-stop deactivation. No need to "
-                   "redo hw interface and controller start sequence." );
-      return SequenceOutcome::Completed;
-    }
-    RCLCPP_INFO( get_logger(), "Hardware Interface must be reactivated after estop deactivation" );
-  }
-
-  // ===== Hardware =========================================================
-  for ( const auto &hw : hw_interfaces_ ) {
-    while ( rclcpp::ok() ) {
-      if ( abortRequested() ) {
-        RCLCPP_WARN( get_logger(),
-                     "E-stop engaged while activating hardware '%s'. Abandoning this startup "
-                     "sequence.",
-                     hw.c_str() );
-        return abandon();
-      }
-      if ( loadAndActivateHardware( hw ) ) {
-        RCLCPP_DEBUG( get_logger(), "Hardware '%s' is active.", hw.c_str() );
-        break;
-      }
-      RCLCPP_WARN( get_logger(), "Hardware '%s' failed – retrying in %.1fs", hw.c_str(),
-                   retry_delay_.load() );
-      rclcpp::sleep_for( sleep_ns );
-    }
+    RCLCPP_DEBUG( get_logger(), "Hardware '%s' is active.", hw.c_str() );
   }
   if ( abortRequested() ) {
     RCLCPP_WARN( get_logger(),
@@ -251,13 +208,14 @@ SequenceOutcome MultiSpawner::start_sequence()
     // controllers the manager already holds, which it refuses, forever.
     RCLCPP_WARN( get_logger(),
                  "Could not read the controller states. Retrying the startup sequence in %.1fs.",
-                 retry_delay_.load() );
+                 retry_delay_ );
     rclcpp::sleep_for( sleep_ns );
     return abandon();
   }
 
   // 1) Decide what to load / activate / deactivate -------------------------
   std::vector<std::string> to_load;
+  std::vector<std::string> to_configure;
   std::vector<std::string> to_activate;
   std::vector<std::string> to_deactivate;
 
@@ -271,6 +229,11 @@ SequenceOutcome MultiSpawner::start_sequence()
 
     if ( !present )
       to_load.push_back( name );
+    // Loaded and configured are separate states. Taking the configure list from what was just
+    // loaded would never come back to a controller whose load succeeded and whose configure did
+    // not, because the next attempt finds it present and skips it.
+    if ( !present || it->second == "unconfigured" )
+      to_configure.push_back( name );
 
     if ( cfg.activate ) {
       if ( !active )
@@ -291,51 +254,55 @@ SequenceOutcome MultiSpawner::start_sequence()
     }
   }
 
+  // Nothing to load, nothing to switch: the robot is already running what the configuration asks
+  // for. Asked of the controllers themselves, because a hardware component stays ACTIVE while the
+  // hardware interface's own e-stop deactivates the controllers underneath it.
+  if ( to_load.empty() && to_configure.empty() && to_activate.empty() && to_deactivate.empty() ) {
+    RCLCPP_INFO( get_logger(), "Controllers are already in the requested state. Nothing to do." );
+    return SequenceOutcome::Completed;
+  }
+
   // 2) Load missing controllers (one service call per controller) ----------
   for ( const auto &name : to_load ) {
-    while ( rclcpp::ok() ) {
-      if ( abortRequested() ) {
-        RCLCPP_WARN( get_logger(),
-                     "E-stop engaged while trying to load '%s'. Abandoning this startup sequence.",
-                     name.c_str() );
-        return abandon();
-      }
-      if ( loadController( name ) ) {
-        RCLCPP_INFO( get_logger(), "Controller '%s' loaded.", name.c_str() );
-        break;
-      }
-      RCLCPP_WARN( get_logger(), "Failed to load '%s' – retrying in %.1fs", name.c_str(),
-                   retry_delay_.load() );
-      rclcpp::sleep_for( sleep_ns );
+    if ( abortRequested() ) {
+      RCLCPP_WARN( get_logger(),
+                   "E-stop engaged while trying to load '%s'. Abandoning this startup sequence.",
+                   name.c_str() );
+      return abandon();
     }
+    if ( !loadController( name ) ) {
+      RCLCPP_WARN( get_logger(), "Failed to load '%s' – retrying the sequence in %.1fs",
+                   name.c_str(), retry_delay_ );
+      rclcpp::sleep_for( sleep_ns );
+      return abandon();
+    }
+    RCLCPP_INFO( get_logger(), "Controller '%s' loaded.", name.c_str() );
   }
 
   // 2.5) Configure missing controllers
-  for ( const auto &name : to_load ) {
-    while ( rclcpp::ok() ) {
-      if ( abortRequested() ) {
-        RCLCPP_WARN(
-            get_logger(),
-            "E-stop engaged while trying to configure '%s'. Abandoning this startup sequence.",
-            name.c_str() );
-        return abandon();
-      }
-      if ( configureController( name ) ) {
-        RCLCPP_INFO( get_logger(), "Controller '%s' configured.", name.c_str() );
-        break;
-      }
-      RCLCPP_WARN( get_logger(), "Failed to configure '%s' – retrying in %.1fs", name.c_str(),
-                   retry_delay_.load() );
-      rclcpp::sleep_for( sleep_ns );
+  for ( const auto &name : to_configure ) {
+    if ( abortRequested() ) {
+      RCLCPP_WARN(
+          get_logger(),
+          "E-stop engaged while trying to configure '%s'. Abandoning this startup sequence.",
+          name.c_str() );
+      return abandon();
     }
+    if ( !configureController( name ) ) {
+      RCLCPP_WARN( get_logger(), "Failed to configure '%s' – retrying the sequence in %.1fs",
+                   name.c_str(), retry_delay_ );
+      rclcpp::sleep_for( sleep_ns );
+      return abandon();
+    }
+    RCLCPP_INFO( get_logger(), "Controller '%s' configured.", name.c_str() );
   }
 
   // 2.5) Re-request current state -> chained info only after configuring available----------------
-  if ( !to_load.empty() && !refreshControllerState( current_state, listing ) ) {
+  if ( !to_configure.empty() && !refreshControllerState( current_state, listing ) ) {
     RCLCPP_WARN( get_logger(),
                  "Could not re-read the controller states after configuring. Retrying the startup "
                  "sequence in %.1fs.",
-                 retry_delay_.load() );
+                 retry_delay_ );
     rclcpp::sleep_for( sleep_ns );
     return abandon();
   }
@@ -357,7 +324,7 @@ SequenceOutcome MultiSpawner::start_sequence()
     RCLCPP_ERROR( get_logger(),
                   "Failed to deactivate the running controllers before re-activating them. "
                   "Retrying the startup sequence in %.1fs.",
-                  retry_delay_.load() );
+                  retry_delay_ );
     rclcpp::sleep_for( sleep_ns );
     return abandon();
   }
@@ -367,7 +334,7 @@ SequenceOutcome MultiSpawner::start_sequence()
     RCLCPP_WARN( get_logger(),
                  "Could not re-read the controller states before activating. Retrying the startup "
                  "sequence in %.1fs.",
-                 retry_delay_.load() );
+                 retry_delay_ );
     rclcpp::sleep_for( sleep_ns );
     return abandon();
   }
@@ -386,7 +353,7 @@ SequenceOutcome MultiSpawner::start_sequence()
     RCLCPP_ERROR( get_logger(),
                   "Failed to activate the requested controllers. Retrying the startup sequence in "
                   "%.1fs.",
-                  retry_delay_.load() );
+                  retry_delay_ );
     rclcpp::sleep_for( sleep_ns );
     return abandon();
   }
@@ -398,7 +365,7 @@ SequenceOutcome MultiSpawner::start_sequence()
     RCLCPP_WARN( get_logger(),
                  "Could not read the controller states to verify them. Retrying the startup "
                  "sequence in %.1fs.",
-                 retry_delay_.load() );
+                 retry_delay_ );
     rclcpp::sleep_for( sleep_ns );
     return abandon();
   }
@@ -411,7 +378,6 @@ SequenceOutcome MultiSpawner::start_sequence()
   }
   // Only now: the shortcut on the next sequence skips the controllers entirely, so it may only
   // trust a pass that was carried out and checked.
-  controllers_started_ = true;
   RCLCPP_INFO( get_logger(), " Multi Controller Spawner complete – shutting down." );
   return SequenceOutcome::Completed;
 }

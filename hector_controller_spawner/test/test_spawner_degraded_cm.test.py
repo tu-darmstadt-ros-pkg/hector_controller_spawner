@@ -1,9 +1,9 @@
 """The startup sequence has to survive a controller_manager that stops answering.
 
 Right after a physical e-stop the manager can hold its resource lock for seconds, so the calls the
-restart path makes can time out. Nothing spins the spawner outside its main loop, so a timed-out
-call's answer never arrives: waiting on it blocks the process for good, and the robot is never
-brought back.
+sequence makes can time out. A timed-out call's answer never arrives, so waiting on it would block
+the process for good and the robot would never be brought back. The sequence has to give up on the
+attempt and start another one instead.
 """
 
 import os
@@ -40,7 +40,7 @@ def generate_test_description():
             fake_cm,
             "--ros-args",
             "-p",
-            "never_answer:=['list_hardware_components']",
+            "never_answer:=['set_hardware_component_state']",
             "-p",
             "hardware:=['athena_arm_interface']",
         ],
@@ -90,22 +90,14 @@ class TestSpawnerSurvivesUnansweredCall(unittest.TestCase):
             self.estop_pub.publish(msg)
             rclpy.spin_once(self.node, timeout_sec=0.1)
 
-    def test_unanswered_list_does_not_wedge_the_sequence(
+    def test_unanswered_call_does_not_wedge_the_sequence(
         self, proc_output, spawner_node
     ):
-        # The first sequence has to finish before an e-stop cycle can drive the restart path, which
-        # is the one that asks for the hardware components. The fake manager receives that request
-        # and never answers it.
-        self._publish_estop(False)
-        proc_output.assertWaitFor(
-            "Multi Controller Spawner complete", process=spawner_node, timeout=30
-        )
-
-        self._publish_estop(True)
-        rclpy.spin_once(self.node, timeout_sec=1.0)
+        # The fake manager receives the hardware activation and never answers it, which is what its
+        # resource lock looks like from outside.
         self._publish_estop(False)
 
-        marker = "Retrying the startup sequence"
+        marker = "retrying the sequence in"
         proc_output.assertWaitFor(marker, process=spawner_node, timeout=30)
 
         # One occurrence is only the call timing out. A second is the sequence having been
@@ -124,3 +116,7 @@ class TestSpawnerSurvivesUnansweredCall(unittest.TestCase):
             2,
             "The startup sequence never came back after the call that was never answered",
         )
+
+        # And it does not retry for ever: a manager that never answers is not a busy one, so the
+        # attempt count runs out and the process can report the failure.
+        proc_output.assertWaitFor("Gave up after", process=spawner_node, timeout=60)

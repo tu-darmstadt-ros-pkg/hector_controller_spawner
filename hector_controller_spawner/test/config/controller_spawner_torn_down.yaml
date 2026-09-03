@@ -1,0 +1,15 @@
+/**:
+  ros__parameters:
+    estop_topic: estop_board/hard_estop
+
+    retry_delay: 1.0
+    service_call_timeout_ms: 2000
+
+    hardware_interfaces:
+    - athena_arm_interface
+
+    controllers:
+    - joint_state_broadcaster
+
+    joint_state_broadcaster:
+      activate: true

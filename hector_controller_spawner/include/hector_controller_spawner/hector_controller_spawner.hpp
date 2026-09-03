@@ -11,11 +11,9 @@
 
 #include <controller_manager_msgs/srv/configure_controller.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
-#include <controller_manager_msgs/srv/list_hardware_components.hpp>
 #include <controller_manager_msgs/srv/load_controller.hpp>
 #include <controller_manager_msgs/srv/set_hardware_component_state.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
-#include <hector_ros2_utils/parameters/reconfigurable_parameter.hpp>
 #include <rclcpp/parameter_client.hpp>
 namespace hector_controller_spawner
 {
@@ -116,38 +114,19 @@ private:
   std::unordered_map<std::string, ControllerCfg> controller_cfg_;
   // std::vector<ControllerGroup> controller_groups_;
   std::unordered_map<std::string, ControllerChainInfo> controller_info_;
-  // Written by the parameter callbacks, which run on the executor thread while the sequence runs
-  // on its own. Atomic so a value changing mid-sequence is a race the language defines.
-  std::atomic<double> retry_delay_{ 5.0 };
-  double start_delay_{ 0.0 }; // read once, during initialize()
+  // All read once in initialize(), before the spin thread exists, and never written again.
+  double retry_delay_{ 5.0 };
+  double start_delay_{ 0.0 };
   std::string estop_topic_;
-  std::atomic<bool> restart_after_estop_deactivation_{ true };
-  std::atomic<bool> load_groups_one_by_one_{ true };
-  std::atomic<int> service_call_timeout_ms_{ 5000 };
-
-  /// The plain values the reconfigurable-parameter helper owns and writes. Mirrored into the
-  /// atomics above by its update callback, which is the only thing that reads them.
-  double retry_delay_value_{ 5.0 };
-  bool restart_after_estop_deactivation_value_{ true };
-  bool load_groups_one_by_one_value_{ true };
-  int service_call_timeout_ms_value_{ 5000 };
-
-  hector::ParameterSubscription retry_delay_param_sub_;
-  hector::ParameterSubscription start_delay_param_sub_;
-  hector::ParameterSubscription restart_after_estop_deactivation_param_sub_;
-  hector::ParameterSubscription load_groups_one_by_one_param_sub_;
-  hector::ParameterSubscription service_call_timeout_ms_param_sub_;
+  bool restart_after_estop_deactivation_{ true };
+  bool load_groups_one_by_one_{ true };
+  int service_call_timeout_ms_{ 5000 };
 
   /// Cleared when a sequence starts and set again by an e-stop release, so a release that lands
   /// while a sequence runs still asks for the next one.
   std::atomic<bool> run_requested_{ true };
   std::atomic<bool> released_{ false };
   std::atomic<bool> sequence_failed_{ false };
-  /// Whether a sequence has ever finished and verified its controller phase. The restart shortcut
-  /// needs this: hardware left active by an attempt that was abandoned before the controllers is
-  /// not a robot that has nothing left to do.
-  bool controllers_started_{ false };
-
   /// Attempts abandoned back to back. A failure that repeats is not a busy manager, and retrying
   /// it forever leaves whatever waits for this process waiting for good. Reset by an e-stop
   /// release, which runs on the executor thread.
@@ -165,7 +144,6 @@ private:
   rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_ctrl_client_;
   rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr list_ctrl_client_;
   rclcpp::Client<controller_manager_msgs::srv::ConfigureController>::SharedPtr configure_ctrl_client_;
-  rclcpp::Client<controller_manager_msgs::srv::ListHardwareComponents>::SharedPtr list_hardware_ctrl_client_;
   rclcpp::AsyncParametersClient::SharedPtr cm_param_client_;
   // ----- subscription -----
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
