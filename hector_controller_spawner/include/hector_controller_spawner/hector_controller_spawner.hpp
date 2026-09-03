@@ -121,6 +121,9 @@ private:
   bool restart_after_estop_deactivation_{ true };
   bool load_groups_one_by_one_{ true };
   int service_call_timeout_ms_{ 5000 };
+  /// Bringing a hardware component up runs its on_activate, which on a serial bus takes seconds to
+  /// a minute. Sized for that rather than for a listing, and per robot.
+  double hardware_activation_timeout_s_{ 60.0 };
 
   /// Cleared when a sequence starts and set again by an e-stop release, so a release that lands
   /// while a sequence runs still asks for the next one.
@@ -136,6 +139,11 @@ private:
   std::chrono::milliseconds serviceCallTimeout() const
   {
     return std::chrono::milliseconds( service_call_timeout_ms_ );
+  }
+
+  std::chrono::milliseconds hardwareActivationTimeout() const
+  {
+    return std::chrono::milliseconds( static_cast<int>( hardware_activation_timeout_s_ * 1000.0 ) );
   }
 
   // ----- service clients -----

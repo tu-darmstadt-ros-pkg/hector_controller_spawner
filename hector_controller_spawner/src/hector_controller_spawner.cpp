@@ -37,6 +37,14 @@ void MultiSpawner::initialize()
       this->declare_parameter<bool>( "restart_after_estop_deactivation", true );
   load_groups_one_by_one_ = this->declare_parameter<bool>( "load_groups_one_by_one", true );
   service_call_timeout_ms_ = this->declare_parameter<int>( "service_call_timeout_ms", 5000 );
+  hardware_activation_timeout_s_ =
+      this->declare_parameter<double>( "hardware_activation_timeout", 60.0 );
+  if ( !( hardware_activation_timeout_s_ > 0.0 ) ) {
+    RCLCPP_WARN( get_logger(),
+                 "hardware_activation_timeout must be positive; using 60s instead of %.1f.",
+                 hardware_activation_timeout_s_ );
+    hardware_activation_timeout_s_ = 60.0;
+  }
   if ( service_call_timeout_ms_ <= 0 ) {
     RCLCPP_WARN( get_logger(), "service_call_timeout_ms must be positive; using 5000 instead of %d.",
                  service_call_timeout_ms_ );
@@ -574,8 +582,10 @@ bool MultiSpawner::switchControllersRequest( const std::vector<std::string> &to_
   req->strictness = controller_manager_msgs::srv::SwitchController::Request::BEST_EFFORT;
   req->timeout = rclcpp::Duration::from_seconds( 5.0 );
 
+  // Longer than the deadline just asked of the manager, or the reply to a switch that took the
+  // time it was allowed can never be waited for.
   auto fut = switch_ctrl_client_->async_send_request( req );
-  if ( fut.wait_for( serviceCallTimeout() ) != std::future_status::ready ) {
+  if ( fut.wait_for( serviceCallTimeout() + std::chrono::seconds( 5 ) ) != std::future_status::ready ) {
     RCLCPP_WARN( get_logger(), "The controller manager did not answer the switch request." );
     switch_ctrl_client_->remove_pending_request( fut );
     return false;
@@ -623,8 +633,11 @@ bool MultiSpawner::loadAndActivateHardware( const std::string &name )
   act_req->name = name;
   act_req->target_state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
   act_req->target_state.label = "active";
+  // Its own deadline. The manager answers this only once the component's on_activate has returned,
+  // which for a serial bus is seconds to a minute, so the timeout that sizes the short calls would
+  // abandon an activation that is simply still running and then ask for it again.
   auto act_future = set_hw_state_client_->async_send_request( act_req );
-  if ( act_future.wait_for( serviceCallTimeout() ) != std::future_status::ready ) {
+  if ( act_future.wait_for( hardwareActivationTimeout() ) != std::future_status::ready ) {
     set_hw_state_client_->remove_pending_request( act_future );
     return false;
   }

@@ -5,6 +5,8 @@
     # Short, so a retry that does happen is visible inside the test's patience.
     retry_delay: 1.0
     service_call_timeout_ms: 1000
+    # Short, so a manager that never answers is given up on inside the test's patience.
+    hardware_activation_timeout: 2.0
 
     hardware_interfaces:
     - athena_arm_interface
