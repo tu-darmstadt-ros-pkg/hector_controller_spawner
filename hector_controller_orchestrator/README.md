@@ -13,14 +13,17 @@ The `hector_controller_orchestrator` package provides a C++ library to simplify 
 
 ### Class Integration (as a Node Member)
 
-Create the orchestrator as a `shared_ptr` member of your node class. Pass your node (or `shared_from_this()`) and optionally the controller manager name (defaults to `controller_manager`).
+Pass your node and optionally the controller manager name (defaults to `controller_manager`). The orchestrator does not keep the node alive, so the node can own it. It works as a plain member, a `shared_ptr` or on the stack.
 
 ```cpp
 #include <controller_orchestrator/controller_orchestrator.hpp>
 
 class MyNode : public rclcpp::Node {
 public:
-    MyNode() : rclcpp::Node("my_node") {
+    MyNode() : rclcpp::Node("my_node") {}
+
+    // shared_from_this() is not available in the constructor
+    void init() {
         orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
                 shared_from_this());
     }
@@ -29,6 +32,8 @@ private:
     std::shared_ptr<controller_orchestrator::ControllerOrchestrator> orchestrator_;
 };
 ```
+
+When the destructor returns, no callback of the orchestrator is running or will run. It waits for callbacks in progress on other threads, so a callback may capture `this` of the owner. A callback may also destroy the orchestrator itself.
 
 ### ⚠️ Important: Executor Requirements for Blocking Functions
 
@@ -77,6 +82,10 @@ orchestrator->smartSwitchControllerAsync(target_controllers,
     });
 ```
 
+The callback fires exactly once, unless the orchestrator is destroyed first. A newer switch request answers an older one with `false` at once,
+and a service call the controller manager leaves unanswered fails the request after
+`step_timeout_s` (default 5 s), naming the step and the controllers already switched.
+
 ### How "Smart Switch" Works
 
 1. **Dependency Expansion**: If you request controller A, and A depends on B (chained), the orchestrator automatically adds B to the activation list.
@@ -111,10 +120,14 @@ Find all active controllers that claim a specific hardware interface:
 
 ```cpp
 std::string hardware_interface = "joint1";
-std::vector<std::string> active_controllers =
+std::optional<std::vector<std::string>> active_controllers =
     orchestrator->getActiveControllerOfHardwareInterface(hardware_interface, timeout_s);
+if (!active_controllers) {
+    // The controller manager did not answer or the component is not loaded.
+    return;
+}
 
-for (const auto& ctrl : active_controllers) {
+for (const auto& ctrl : *active_controllers) {
     RCLCPP_INFO(rclcpp::get_logger("my_node"),
                 "Controller %s is using %s", ctrl.c_str(), hardware_interface.c_str());
 }
@@ -124,12 +137,12 @@ for (const auto& ctrl : active_controllers) {
 
 This is useful for determining which controllers need to be stopped before performing maintenance or switching to a different control strategy for a specific joint.
 
-#### Unload Controllers for a Joint
+#### Deactivate Controllers for a Joint
 Automatically deactivate all controllers claiming a specific joint, including their dependents:
 
 ```cpp
 std::string joint_name = "shoulder_pan_joint";
-bool success = orchestrator->unloadControllersOfJoint(joint_name, timeout_s);
+bool success = orchestrator->deactivateControllersOfJoint(joint_name, timeout_s);
 ```
 
 **⚠️ Warning**: This is a blocking call. Do not use in SingleThreadedExecutor callbacks.

@@ -19,7 +19,8 @@ find_package(controller_manager_msgs REQUIRED)
 # -------------------------------------------------------------------
 # 1) Build the controller_orchestrator library
 # -------------------------------------------------------------------
-add_library(${PROJECT_NAME} SHARED src/controller_orchestrator.cpp)
+add_library(${PROJECT_NAME} SHARED src/controller_orchestrator.cpp
+                                   src/controller_graph.cpp)
 
 target_include_directories(
   ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -97,6 +98,11 @@ if(BUILD_TESTING)
     realtime_tools::realtime_tools
     rclcpp::rclcpp
     ${std_msgs_TARGETS})
+
+  ament_add_gtest(controller_graph_test test/test_controller_graph.cpp)
+  target_include_directories(controller_graph_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(controller_graph_test ${PROJECT_NAME})
 
   ament_add_gtest(stale_switch_chain_test test/test_stale_switch_chain.cpp
                   TIMEOUT 120)

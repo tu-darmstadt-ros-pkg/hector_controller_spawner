@@ -126,7 +126,7 @@ protected:
 
     ASSERT_TRUE( list_client_->wait_for_service( *executor_, 10s ) );
 
-    orchestrator_ = controller_orchestrator::ControllerOrchestrator::create(
+    orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
         tester_node_, "/controller_manager" );
 
     ASSERT_TRUE( start_spawner_node() );
@@ -670,8 +670,8 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, AnOrchestratorBuiltAfterBringUpK
   // orchestrator created once the robot is already up gets one retained sample or nothing at all.
   // Without it every cached answer is "not active" for controllers that have been running for
   // hours, and the caller cannot tell that from a real answer.
-  auto late = controller_orchestrator::ControllerOrchestrator::create( this->tester_node_,
-                                                                       "/controller_manager" );
+  auto late = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
+      this->tester_node_, "/controller_manager" );
   EXPECT_TRUE( this->executor_->spin_until(
       [&late]() { return late->isControllerActive( "flipper_velocity_controller" ); }, 10s ) )
       << "A late orchestrator never learned that a running controller was active.";
@@ -966,10 +966,12 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, GetActiveControllerOfHardwareInt
 {
   bool is_multiple_chained_config =
       ( std::string( TypeParam::ConfigType::name() ) == "MultipleChained" );
-  const auto flipper_controllers = spin_while_executing( *this->executor_, [this]() {
+  const auto flipper_result = spin_while_executing( *this->executor_, [this]() {
     return this->orchestrator_->getActiveControllerOfHardwareInterface( "athena_flipper_interface",
                                                                         10 );
   } );
+  ASSERT_TRUE( flipper_result.has_value() );
+  const auto &flipper_controllers = *flipper_result;
   // at startup, there should be a controller chain of two controllers active on the flipper interface
   EXPECT_NE( std::find( flipper_controllers.begin(), flipper_controllers.end(),
                         "flipper_velocity_controller" ),
@@ -981,9 +983,11 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, GetActiveControllerOfHardwareInt
   int flp_ctrls = is_multiple_chained_config ? 3 : 2;
   EXPECT_EQ( flipper_controllers.size(), flp_ctrls );
 
-  const auto arm_controllers = spin_while_executing( *this->executor_, [this]() {
+  const auto arm_result = spin_while_executing( *this->executor_, [this]() {
     return this->orchestrator_->getActiveControllerOfHardwareInterface( "athena_arm_interface", 10 );
   } );
+  ASSERT_TRUE( arm_result.has_value() );
+  const auto &arm_controllers = *arm_result;
   // at startup, there should be two controllers active on the arm interface (not a chain)
   EXPECT_NE( std::find( arm_controllers.begin(), arm_controllers.end(), "arm_trajectory_controller" ),
              arm_controllers.end() );
@@ -998,10 +1002,11 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, GetActiveControllerOfHardwareInt
   int arm_ctrls = is_multiple_chained_config ? 3 : 2;
   EXPECT_EQ( arm_controllers.size(), arm_ctrls );
 
+  // Unknown component: the result is nullopt, not an empty list.
   const auto unknown_controllers = spin_while_executing( *this->executor_, [this]() {
     return this->orchestrator_->getActiveControllerOfHardwareInterface( "unknown_interface", 10 );
   } );
-  EXPECT_TRUE( unknown_controllers.empty() );
+  EXPECT_FALSE( unknown_controllers.has_value() );
 }
 
 TYPED_TEST( ControllerOrchestratorTypedFixture, UnloadControllersOfJoint )
@@ -1010,11 +1015,11 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, UnloadControllersOfJoint )
       ( std::string( TypeParam::ConfigType::name() ) == "MultipleChained" );
   // case: unknown joint → no-op
   ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->unloadControllersOfJoint( "unknown_joint", 10 );
+    return this->orchestrator_->deactivateControllersOfJoint( "unknown_joint", 10 );
   } ) );
   // case: joint with active controller → deactivate controller
   ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->unloadControllersOfJoint( "gripper_servo_joint", 10 );
+    return this->orchestrator_->deactivateControllersOfJoint( "gripper_servo_joint", 10 );
   } ) );
   ASSERT_TRUE(
       this->wait_for_list_states( { { "gripper_trajectory_controller", "inactive" } }, 20s ) );
@@ -1023,7 +1028,7 @@ TYPED_TEST( ControllerOrchestratorTypedFixture, UnloadControllersOfJoint )
   const int active_before = this->get_number_of_active_controllers();
   ASSERT_GT( active_before, 0 );
   ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->unloadControllersOfJoint( "flipper_fl_joint", 10 );
+    return this->orchestrator_->deactivateControllersOfJoint( "flipper_fl_joint", 10 );
   } ) );
   ASSERT_TRUE( this->wait_for_list_states(
       { { "flipper_velocity_controller", "inactive" }, { "vel_to_pos_controller", "inactive" } },

@@ -2,6 +2,7 @@
 #define CONTROLLER_ORCHESTRATOR_CONTROLLER_ORCHESTRATOR_HPP
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,42 +28,30 @@ namespace controller_orchestrator
  * - Chain management: Resolves downstream dependencies and upstream dependents for chained controllers.
  * - Async/Sync operations: Provides both blocking and non-blocking interfaces for common tasks.
  * - State caching: Maintains a local cache of controller states for faster access.
+ *
+ * Responses are delivered by the executor spinning the node. The blocking calls wait for one, so
+ * they need another thread of that executor to be free.
  */
-class ControllerOrchestrator : public std::enable_shared_from_this<ControllerOrchestrator>
+class ControllerOrchestrator
 {
-  using ListControllers = controller_manager_msgs::srv::ListControllers;
-  using SwitchController = controller_manager_msgs::srv::SwitchController;
-  using ListHardwareComponents = controller_manager_msgs::srv::ListHardwareComponents;
-
-private:
-  /// Lets make_shared reach the constructor without opening it to everyone else.
-  struct OwnedBySharedPtr {
-    explicit OwnedBySharedPtr() = default;
-  };
-
 public:
+  using Callback = std::function<void( bool success, const std::string &message )>;
+
   /**
    * @brief Construct a new Controller Orchestrator object.
-   *
-   * Only reachable through create(). Every async callback holds a weak reference to this object and
-   * does nothing if it cannot be locked, so one that is not owned by a shared_ptr would answer no
-   * caller and time out every blocking call while blaming the executor.
+   * @param node The node to talk to the controller manager through. Not kept alive by the
+   *        orchestrator, so the node may own it.
+   * @param controller_manager_name Name of the controller manager node.
    */
-  ControllerOrchestrator( OwnedBySharedPtr, const rclcpp::Node::SharedPtr &node,
-                          const std::string &controller_manager_name );
+  explicit ControllerOrchestrator(
+      const rclcpp::Node::SharedPtr &node,
+      const std::string &controller_manager_name = "controller_manager" );
 
-  /**
-   * @brief Build an orchestrator.
-   * @param node Shared pointer to the parent node.
-   * @param controller_manager_name Name of the controller manager node (default: "controller_manager").
-   */
-  static std::shared_ptr<ControllerOrchestrator>
-  create( const rclcpp::Node::SharedPtr &node,
-          const std::string &controller_manager_name = "controller_manager" );
-
-  /// Drops the subscription and the clients first. Declared before the cache and its mutex, they
-  /// would otherwise be destroyed last and go on feeding callbacks into state that is already gone.
+  /// Waits for callbacks of this orchestrator running on other threads. None runs afterwards.
   ~ControllerOrchestrator();
+
+  ControllerOrchestrator( const ControllerOrchestrator & ) = delete;
+  ControllerOrchestrator &operator=( const ControllerOrchestrator & ) = delete;
 
   /**
    * @brief Tries to activate the given controllers, deactivating all conflicting controllers.
@@ -74,7 +63,7 @@ public:
    * @param timeout_s Timeout in seconds for the operation (default 10s).
    * @return true if the switch operation was successful.
    */
-  bool smartSwitchController( std::vector<std::string> &activate_controllers,
+  bool smartSwitchController( const std::vector<std::string> &activate_controllers,
                               int timeout_s = 10 ) const;
 
   /**
@@ -83,25 +72,26 @@ public:
    * Analyzes dependencies and conflicts, then performs the switch operation non-blockingly.
    *
    * @param activate_controllers List of controllers to activate.
-   * @param callback Function to call upon completion with (success, message). Invoked exactly once,
-   *        including when a newer request takes the controllers over before this chain finishes.
-   * @param claimed_generation_out Optional: the generation this request claimed, so a caller that
-   *        gives up can retire its own chain without touching one that has since superseded it.
-   *        Left untouched when the request answered without starting a chain.
+   * @param callback Function to call upon completion with (success, message). Invoked exactly once
+   *        unless the orchestrator is destroyed first, including when a newer request takes the
+   *        controllers over before this chain finishes. A newer request answers this one with false
+   *        straight away, and so does a step the controller manager leaves unanswered for
+   *        @p step_timeout_s.
+   * @param step_timeout_s How long each service call of the chain may go unanswered.
    */
-  void smartSwitchControllerAsync(
-      const std::vector<std::string> &activate_controllers,
-      const std::function<void( bool success, const std::string &message )> &callback,
-      uint64_t *claimed_generation_out = nullptr ) const;
+  void smartSwitchControllerAsync( const std::vector<std::string> &activate_controllers,
+                                   const Callback &callback, int step_timeout_s = 5 ) const;
 
   /**
    * @brief Get a list of currently active controllers that claim a specific hardware interface.
-   * @param hardware_interface Name of the hardware interface (e.g., "joint1").
-   * @param timeout_s Timeout in seconds for the operation.
-   * @return Vector of active controller names.
+   * @param hardware_interface Name of the hardware component (e.g., "athena_arm_interface").
+   * @param timeout_s Timeout in seconds for the whole operation.
+   * @return Active controllers claiming a command interface of @p hardware_interface. Empty if
+   *         none is active. nullopt if the services did not answer or the component is not loaded.
    */
-  std::vector<std::string> getActiveControllerOfHardwareInterface( const std::string &hardware_interface,
-                                                                   int timeout_s = 10 ) const;
+  std::optional<std::vector<std::string>>
+  getActiveControllerOfHardwareInterface( const std::string &hardware_interface,
+                                          int timeout_s = 10 ) const;
 
   /**
    * @brief Deactivate the given list of controllers.
@@ -126,12 +116,19 @@ public:
                             int timeout_s = 10 ) const;
 
   /**
-   * @brief Unload all active controllers claiming any interface of a specific joint.
+   * @brief Deactivate all active controllers claiming any interface of a specific joint, together
+   *        with the controllers chained to them.
    * @param joint_name Name of the joint.
-   * @param timeout_s Timeout in seconds.
+   * @param timeout_s Timeout in seconds for the whole operation.
    * @return true if the controllers were deactivated successfully.
    */
-  bool unloadControllersOfJoint( const std::string &joint_name, int timeout_s = 10 );
+  bool deactivateControllersOfJoint( const std::string &joint_name, int timeout_s = 10 ) const;
+
+  [[deprecated( "Use deactivateControllersOfJoint, which does the same." )]]
+  bool unloadControllersOfJoint( const std::string &joint_name, int timeout_s = 10 ) const
+  {
+    return deactivateControllersOfJoint( joint_name, timeout_s );
+  }
 
   /**
    * @brief Query the controller manager and update the local state cache (blocking).
@@ -142,12 +139,12 @@ public:
 
   /**
    * @brief Query the controller manager and update the local state cache (asynchronous).
-   * @param callback Function to call upon completion.
+   * @param callback Function to call upon completion. Invoked exactly once unless the
+   *        orchestrator is destroyed first, with false if no answer arrives within @p timeout_s.
    * @param timeout_s Timeout in seconds.
    */
-  void refreshControllerStatesAsync(
-      const std::function<void( bool success, const std::string &message )> &callback,
-      int timeout_s = 10 ) const;
+  void refreshControllerStatesAsync( const Callback &callback, int timeout_s = 10 ) const;
+
   /**
    * @brief Checks if the controllers is currently active.
    * @param controller_name controller names to check
@@ -163,188 +160,9 @@ public:
   bool areControllersActive( const std::vector<std::string> &controller_names ) const;
 
 private:
-  /// @brief Subscribe to the manager's activity topic. Called by create(), where weak_from_this()
-  /// is valid; it is not inside the constructor.
-  void subscribeToActivity();
-
-  // ============================================================================
-  // State Management
-  // ============================================================================
-
-  /**
-   * @brief Updates the internal controller states cache from a list_controllers response.
-   * @param res Response from the list_controllers service
-   */
-  void updateControllerStatesFromList(
-      const controller_manager_msgs::srv::ListControllers_Response &res ) const;
-
-  // ============================================================================
-  // Controller Chain Analysis
-  // ============================================================================
-
-  /**
-   * @brief Builds forward and reverse chain connection maps from controller information.
-   *
-   * Forward map: controller -> list of controllers it chains to
-   * Reverse map: controller -> list of controllers that chain to it
-   *
-   * @param controllers List of controller states from list_controllers response
-   * @param forward_connections Output: forward chain connections
-   * @param reverse_connections Output: reverse chain connections
-   */
-  void buildChainConnectionMaps(
-      const std::vector<controller_manager_msgs::msg::ControllerState> &controllers,
-      std::unordered_map<std::string, std::vector<std::string>> &forward_connections,
-      std::unordered_map<std::string, std::vector<std::string>> &reverse_connections ) const;
-
-  /**
-   * @brief Get all downstream dependencies of the given controllers.
-   * @param seed_controllers List of controller names to start from
-   * @param forward_connections Forward chain connection map (use buildChainConnectionMaps to create)
-   * @return Set of all downstream dependent controller names
-   */
-  std::unordered_set<std::string> getDownstreamDependencies(
-      const std::vector<std::string> &seed_controllers,
-      const std::unordered_map<std::string, std::vector<std::string>> &forward_connections ) const;
-
-  /**
-   * @brief Get all upstream dependents of the given controllers.
-   * @param seed_controllers List of controller names to start from
-   * @param reverse_connections Reverse chain connection map (use buildChainConnectionMaps to create)
-   * @return Set of all upstream dependent controller names
-   */
-  std::unordered_set<std::string> getUpstreamDependents(
-      const std::vector<std::string> &seed_controllers,
-      const std::unordered_map<std::string, std::vector<std::string>> &reverse_connections ) const;
-
-  /**
-   * @brief Performs topological sort on active controllers in a chain.
-   *
-   * Returns controllers ordered such that dependencies are satisfied:
-   * - Controllers earlier in the list should be deactivated first
-   * - Controllers later in the list should be activated first
-   *
-   * @param active_controllers Set of active controllers to sort
-   * @param forward_connections Forward chain connection map (use buildChainConnectionMaps to create)
-   * @return Topologically sorted list of controllers, or nothing if a cycle makes the order
-   *         undefinable. An empty list is a valid answer meaning there was nothing to sort.
-   */
-  std::optional<std::vector<std::string>> topologicalSortControllers(
-      const std::unordered_set<std::string> &active_controllers,
-      const std::unordered_map<std::string, std::vector<std::string>> &forward_connections ) const;
-
-  /**
-   * @brief Builds a map of controller names to their claimed command interfaces.
-   * @param controllers List of controller states from list_controllers response
-   * @return Map from controller name to vector of claimed interface names
-   */
-  std::unordered_map<std::string, std::vector<std::string>> buildControllerResourceMap(
-      const std::vector<controller_manager_msgs::msg::ControllerState> &controllers ) const;
-
-  // ============================================================================
-  // Smart Switch Analysis
-  // ============================================================================
-
-  /**
-   * @brief Analyzes which controllers to activate and deactivate for a smart switch.
-   *
-   * This method:
-   * 1. Validates requested controllers exist
-   * 2. Removes already-active controllers from activation list
-   * 3. Adds all chain-connected controllers to activation list
-   * 4. Identifies resource conflicts with currently active controllers
-   * 5. Adds conflicting controllers and their dependents to deactivation list
-   *
-   * @param to_activate Input/Output: controllers to activate (modified in place)
-   * @param to_deactivate Output: controllers that must be deactivated
-   * @param res Response from list_controllers service
-   * @return true if analysis succeeded, false on error
-   */
-  bool smartSwitchControllerAnalysis(
-      std::vector<std::string> &to_activate, std::vector<std::string> &to_deactivate,
-      const controller_manager_msgs::srv::ListControllers_Response &res ) const;
-
-  // ============================================================================
-  // Async Operations
-  // ============================================================================
-
-  /**
-   * @brief Recursively activates controllers in reverse order (last to first).
-   *
-   * This is part of the async switching mechanism. Controllers are activated
-   * one at a time, starting from the end of the list.
-   *
-   * @param controllers_to_activate Shared pointer to list of controllers
-   * @param index Current index to activate (decrements with each recursion)
-   * @param callback Callback to invoke when all activations complete or on error
-   */
-  void recursiveActivateControllers(
-      std::shared_ptr<std::vector<std::string>> controllers_to_activate, size_t index,
-      const std::function<void( bool success, const std::string &message )> &callback,
-      uint64_t generation ) const;
-
-  /**
-   * @brief Recursively deactivates controllers in reverse order, then activates.
-   *
-   * This is part of the async switching mechanism. Controllers are deactivated
-   * one at a time from last to first, then activation begins.
-   *
-   * @param controllers_to_activate Shared pointer to list of controllers to activate after deactivation
-   * @param controllers_to_deactivate Shared pointer to list of controllers to deactivate
-   * @param index Current index to deactivate (decrements with each recursion)
-   * @param callback Callback to invoke when all operations complete or on error
-   */
-  void recursiveDeactivateControllers(
-      std::shared_ptr<std::vector<std::string>> controllers_to_activate,
-      std::shared_ptr<std::vector<std::string>> controllers_to_deactivate, size_t index,
-      const std::function<void( bool success, const std::string &message )> &callback,
-      uint64_t generation ) const;
-
-  /**
-   * @brief Replace the whole state cache in one step.
-   *
-   * Takes the new map by value so the caller builds it outside the lock: the critical section is
-   * then a move rather than a clear plus one allocation per controller, and no reader can observe
-   * a half-rebuilt cache.
-   */
-  void replaceControllerStates( std::unordered_map<std::string, std::string> states ) const;
-
-  /**
-   * @brief Whether @p controller_name is cached as active.
-   * @pre controller_states_mutex_ is held.
-   *
-   * Split out from the public accessors because std::shared_lock is not recursive: a public entry
-   * point calling another would deadlock, and a name carrying the precondition is what stops
-   * someone writing that.
-   */
-  bool isActiveLocked( const std::string &controller_name ) const;
-
-  rclcpp::Node::SharedPtr node_;
-  std::string controller_manager_name_;
-
-  /// Serves the activity subscription. Mutually exclusive: the callback replaces the cache
-  /// wholesale, so dispatching it to several threads at once only makes them queue on the mutex.
-  rclcpp::CallbackGroup::SharedPtr cache_callback_group_;
-  /// Serves the service clients. Reentrant by necessity - a blocking call parks one thread of this
-  /// group waiting for a response another thread of the same group has to deliver.
-  rclcpp::CallbackGroup::SharedPtr client_callback_group_;
-
-  rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr list_controllers_client_;
-  rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_controller_client_;
-  rclcpp::Client<controller_manager_msgs::srv::ListHardwareComponents>::SharedPtr
-      list_hardware_components_client_;
-  rclcpp::Subscription<controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr
-      activity_subscription_;
-
-  /// Shared, because reads dominate: areControllersActive() is on the e-stop path and asks about
-  /// several controllers at once, while writes happen only when the activity topic ticks.
-  mutable std::shared_mutex controller_states_mutex_;
-  mutable std::unordered_map<std::string, std::string> controller_states_;
-
-  /// Bumped by every new switch request. A chain whose caller has given up - the synchronous
-  /// wrapper times out and returns, but the chain is still armed - stops instead of resuming
-  /// minutes later against a robot that has moved on.
-  mutable std::atomic<uint64_t> switch_generation_{ 0 };
+  struct Core;
+  /// Shared with the callbacks in flight, which hold it weakly and so cannot outlive its state.
+  std::shared_ptr<Core> core_;
 };
 
 } // namespace controller_orchestrator

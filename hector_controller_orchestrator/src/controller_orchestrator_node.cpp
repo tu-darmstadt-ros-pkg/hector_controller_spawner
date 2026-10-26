@@ -17,8 +17,8 @@ int main( int argc, char **argv )
 
   // 3) Instantiate the ControllerOrchestrator, pointing to your controller_manager
   //    (replace "/athena/controller_manager" if your namespace is different)
-  auto orchestrator =
-      controller_orchestrator::ControllerOrchestrator::create( node, "/athena/controller_manager" );
+  auto orchestrator = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
+      node, "/athena/controller_manager" );
 
   // 4) Set up a one‐shot timer to invoke smartSwitchController after ~1 second
   rclcpp::TimerBase::SharedPtr timer =
@@ -30,8 +30,14 @@ int main( int argc, char **argv )
         called = true;
 
         // deactivate controllers of athena_flipper_interface
-        auto to_deactivate =
+        const auto active =
             orchestrator->getActiveControllerOfHardwareInterface( "athena_flipper_interface", 10 );
+        if ( !active ) {
+          RCLCPP_ERROR( node->get_logger(),
+                        "[Test] Could not find out which controllers are active" );
+          return;
+        }
+        const auto &to_deactivate = *active;
         // print the controllers to deactivate
         RCLCPP_INFO( node->get_logger(), "[Test] Controllers to deactivate: [%zu]",
                      to_deactivate.size() );
