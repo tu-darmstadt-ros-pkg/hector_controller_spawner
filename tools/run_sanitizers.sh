@@ -12,8 +12,9 @@
 #
 #   tools/run_sanitizers.sh                 # asan, then tsan, whole suite
 #   tools/run_sanitizers.sh tsan            # tsan only
-#   tools/run_sanitizers.sh tsan --preset ci   # the subset the CI job runs
+#   tools/run_sanitizers.sh tsan --preset ci   # the reduced subset
 #   tools/run_sanitizers.sh asan -R estop   # only tests matching a regex
+#   tools/run_sanitizers.sh tsan --gtest-filter '*Async*'   # only gtest cases matching a pattern
 #   tools/run_sanitizers.sh tsan --no-build # re-run against an existing tree
 #   tools/run_sanitizers.sh tsan --isolate  # one gtest case per process, counted separately
 #
@@ -46,11 +47,20 @@ done < <(colcon list --names-only --base-paths "${REPO_ROOT}")
 PRIMARY_PACKAGE=controller_orchestrator
 
 # The tests CI runs under TSan. Kept here rather than in the workflow so the two
-# cannot drift, and so the same subset is one flag away locally.
+# cannot drift, and so the same subset is one flag away locally. A gtest filter rather than a -R
+# pattern because ctest registers the whole gtest binary as a single test, so -R selects all of it
+# or none of it.
 #
-# All of them: there is one integration test, and it is the only thing that exercises the
-# orchestrator's cache from more than one thread.
-CI_PRESET_REGEX='.'
+# The orchestrator's state cache has one writer, and it runs on a service-response callback; the
+# readers run on whichever thread asked the question. Racing them therefore needs a refresh still
+# in flight while the caller reads, which is what the Async cases set up and what the sync ones
+# rule out by blocking the caller until the response has landed. Of the executors, only the
+# multi-threaded one can run two callbacks at once. The cases left out differ in which controllers
+# they switch, not in how the switch interleaves.
+#
+# Deliberately a subset: TSan costs roughly ten times the wall clock, and the full suite belongs
+# in a manual run of this script with no --preset.
+CI_PRESET_GTEST_FILTER='*_MultiThreaded.*Async*'
 
 usage()
 {
@@ -61,6 +71,7 @@ usage()
 
 MODES=()
 TEST_REGEX=""
+GTEST_FILTER_PATTERN=""
 CTEST_JOBS=1
 DO_BUILD=1
 ISOLATE=0
@@ -72,10 +83,11 @@ while [[ $# -gt 0 ]]; do
     all) MODES+=(asan tsan) ;;
     --preset)
       [[ "${2:-}" == "ci" ]] || { echo "Unknown preset '${2:-}'; only 'ci' exists." >&2; exit 2; }
-      TEST_REGEX="${CI_PRESET_REGEX}"
+      GTEST_FILTER_PATTERN="${CI_PRESET_GTEST_FILTER}"
       shift
       ;;
     -R | --tests) TEST_REGEX="$2"; shift ;;
+    --gtest-filter) GTEST_FILTER_PATTERN="$2"; shift ;;
     -j | --jobs) CTEST_JOBS="$2"; shift ;;
     --no-build) DO_BUILD=0 ;;
     --isolate) ISOLATE=1 ;;
@@ -238,6 +250,12 @@ for mode in "${MODES[@]}"; do
     filter_args=(-R "${TEST_REGEX}")
   fi
 
+  # gtest reads this itself, so it reaches the binaries ctest starts without going through colcon.
+  # Exported before anything lists cases, because --gtest_list_tests honours it too.
+  if [[ -n "${GTEST_FILTER_PATTERN}" ]]; then
+    export GTEST_FILTER="${GTEST_FILTER_PATTERN}"
+  fi
+
   # A build that ends up with BUILD_TESTING off runs zero tests and still exits
   # 0, which looks exactly like a clean sanitizer run. Refuse to report that.
   discovered=$(cd "${build_base}/${PRIMARY_PACKAGE}" &&
@@ -247,6 +265,25 @@ for mode in "${MODES[@]}"; do
     exit 1
   fi
   echo "Running ${discovered} test(s) under ${mode}."
+
+  # ctest counts binaries, not cases, so the check above passes whatever the filter says - a
+  # pattern matching nothing would run one binary that skips all 56 and exits 0. Count the cases
+  # the filter actually leaves, for the same reason the check above exists.
+  if [[ -n "${GTEST_FILTER_PATTERN}" ]]; then
+    matched=0
+    while IFS= read -r name; do
+      binary="${build_base}/${PRIMARY_PACKAGE}/${name}"
+      [[ -f "${binary}" && -x "${binary}" ]] || continue
+      matched=$((matched + $("${binary}" --gtest_list_tests 2>/dev/null |
+        awk '/^[[:space:]]+[A-Za-z_]/ { n++ } END { print n + 0 }')))
+    done < <(cd "${build_base}/${PRIMARY_PACKAGE}" &&
+      ctest -N "${filter_args[@]}" | sed -n 's/^ *Test *#[0-9]*: *//p')
+    if [[ "${matched}" -eq 0 ]]; then
+      echo "No gtest cases match ${GTEST_FILTER_PATTERN} under ${mode}." >&2
+      exit 1
+    fi
+    echo "  ${matched} gtest case(s) match ${GTEST_FILTER_PATTERN}."
+  fi
 
   # Sanitizer runs are memory-hungry (TSan maps a large shadow region per
   # process), hence serial by default.
