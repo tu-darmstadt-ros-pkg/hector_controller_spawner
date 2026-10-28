@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.8)
 project(controller_orchestrator)
 
-# Default to C++17
+# Default to C++20
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
 endif()
 
 if(CMAKE_CXX_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -24,8 +25,9 @@ target_include_directories(
   ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
                          $<INSTALL_INTERFACE:include>)
 
-ament_target_dependencies(${PROJECT_NAME} rclcpp std_msgs
-                          controller_manager_msgs)
+target_link_libraries(
+  ${PROJECT_NAME} PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS}
+                         ${controller_manager_msgs_TARGETS})
 
 # -------------------------------------------------------------------
 # 2) Create the 'controller_orchestrator_node' executable
@@ -33,12 +35,8 @@ ament_target_dependencies(${PROJECT_NAME} rclcpp std_msgs
 add_executable(controller_orchestrator_node
                src/controller_orchestrator_node.cpp)
 
-# ament_target_dependencies adds include paths & links in ROS 2 dependencies
-ament_target_dependencies(controller_orchestrator_node rclcpp std_msgs
-                          controller_manager_msgs)
-
-# Link against our library
-target_link_libraries(controller_orchestrator_node ${PROJECT_NAME})
+# Link against our library, which brings in the ROS 2 dependencies
+target_link_libraries(controller_orchestrator_node PRIVATE ${PROJECT_NAME})
 
 # -------------------------------------------------------------------
 # 3) Install rules
@@ -88,18 +86,18 @@ if(BUILD_TESTING)
   target_compile_definitions(
     controller_orchestrator_test
     PRIVATE TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/config")
-  target_link_libraries(controller_orchestrator_test ${PROJECT_NAME})
-  ament_target_dependencies(
+  target_link_libraries(
     controller_orchestrator_test
-    ament_index_cpp
-    controller_manager
-    controller_manager_msgs
-    hector_controller_spawner
-    hector_testing_utils
-    lifecycle_msgs
-    realtime_tools
-    rclcpp
-    std_msgs)
+    ${PROJECT_NAME}
+    ament_index_cpp::ament_index_cpp
+    controller_manager::controller_manager
+    ${controller_manager_msgs_TARGETS}
+    hector_controller_spawner::hector_controller_spawner_lib
+    hector_testing_utils::hector_testing_utils
+    ${lifecycle_msgs_TARGETS}
+    realtime_tools::realtime_tools
+    rclcpp::rclcpp
+    ${std_msgs_TARGETS})
 endif()
 
 ament_package()

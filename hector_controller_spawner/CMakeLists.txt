@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.8)
 project(hector_controller_spawner)
 
-# Default to C++17
+# Default to C++20
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -24,13 +25,14 @@ target_include_directories(
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
          $<INSTALL_INTERFACE:include>)
 
-ament_target_dependencies(hector_controller_spawner_lib rclcpp std_msgs
-                          controller_manager_msgs hector_ros2_utils)
+target_link_libraries(
+  hector_controller_spawner_lib
+  PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS} ${controller_manager_msgs_TARGETS}
+         hector_ros2_utils::hector_ros2_utils)
 
 add_executable(hector_controller_spawner src/hector_controller_spawner_main.cpp)
-target_link_libraries(hector_controller_spawner hector_controller_spawner_lib)
-ament_target_dependencies(hector_controller_spawner rclcpp std_msgs
-                          controller_manager_msgs hector_ros2_utils)
+target_link_libraries(hector_controller_spawner PRIVATE
+                      hector_controller_spawner_lib)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
