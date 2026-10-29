@@ -20,6 +20,8 @@ void MultiSpawner::initialize()
                                                                       std::vector<std::string>() );
   controllers_ =
       this->declare_parameter<std::vector<std::string>>( "controllers", std::vector<std::string>() );
+  controller_param_files_ = this->declare_parameter<std::vector<std::string>>(
+      "controller_param_files", std::vector<std::string>() );
   retry_delay_param_sub_ = hector::createReconfigurableParameter(
       shared_from_this(), "retry_delay", std::ref( retry_delay_ ), "Retry delay in seconds",
       hector::ParameterOptions<double>().onValidate(
@@ -125,7 +127,10 @@ void MultiSpawner::start_sequence( bool initial_init )
 
   if ( initial_init ) {
     // ===== Copy Parameters ==================================================
-    // replicateParamsToCM();
+    if ( !replicateParamsToCM() ) {
+      RCLCPP_ERROR( get_logger(), "Failed to replicate controller parameters to controller_manager "
+                                  "- controllers may fail to initialize." );
+    }
 
   } else {
     // ===== Restart Necessary ?  ==============================================
@@ -476,6 +481,41 @@ bool MultiSpawner::loadAndActivateHardware( const std::string &name )
     return false;
   }
   return act_future.get()->ok;
+}
+
+bool MultiSpawner::replicateParamsToCM()
+{
+  // controller_manager does not pass its own --params-file down to the controller nodes
+  // it spawns, so e.g. a JointTrajectoryController would come up with an empty 'joints'.
+  // Set '<controller>.params_file' instead, which controller_manager forwards as
+  // --params-file when loading the controller (same as `ros2 control spawner --param-file`).
+  if ( controller_param_files_.empty() )
+    return true;
+
+  if ( !cm_param_client_->wait_for_service( 2s ) ) {
+    RCLCPP_ERROR( get_logger(), "controller_manager parameter service unavailable" );
+    return false;
+  }
+
+  std::vector<rclcpp::Parameter> to_set;
+  for ( const auto &name : controllers_ )
+    to_set.emplace_back( name + ".params_file", controller_param_files_ );
+
+  auto fut = cm_param_client_->set_parameters( to_set );
+  if ( rclcpp::spin_until_future_complete( shared_from_this(), fut, serviceCallTimeout() ) !=
+       rclcpp::FutureReturnCode::SUCCESS ) {
+    RCLCPP_ERROR( get_logger(), "Timed out setting controller parameters on controller_manager" );
+    return false;
+  }
+
+  bool success = true;
+  for ( const auto &result : fut.get() ) {
+    if ( !result.successful ) {
+      RCLCPP_ERROR( get_logger(), "controller_manager rejected parameter: %s", result.reason.c_str() );
+      success = false;
+    }
+  }
+  return success;
 }
 
 bool MultiSpawner::loadController( const std::string &name )

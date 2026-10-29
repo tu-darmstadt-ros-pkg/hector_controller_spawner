@@ -89,6 +89,7 @@ private:
   // ----- parameters -----
   std::vector<std::string> hw_interfaces_;
   std::vector<std::string> controllers_;
+  std::vector<std::string> controller_param_files_;
   std::unordered_map<std::string, ControllerCfg> controller_cfg_;
   // std::vector<ControllerGroup> controller_groups_;
   std::unordered_map<std::string, ControllerChainInfo> controller_info_;
