@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <hector_testing_utils/hector_testing_utils.hpp>
@@ -322,6 +324,35 @@ TEST_F( FakeControllerManagerTest, AnAsyncSwitchWithoutAControllerManagerFailsOn
   // Past the deadline, which must not answer a second time
   std::this_thread::sleep_for( 2500ms );
   EXPECT_EQ( answers.count(), 1u );
+}
+
+// A switch requested right after start-up waits for the service within its own timeout
+TEST_F( FakeControllerManagerTest, AnAsyncSwitchWaitsForALateControllerManager )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  // Unique, so a service of an earlier run still in the discovery cache cannot answer for it
+  const std::string manager = "/late_cm_" + std::to_string( getpid() );
+  controller_orchestrator::ControllerOrchestrator orchestrator( tester_node_, manager );
+
+  Answers answers;
+  orchestrator.smartSwitchControllerAsync( { kController }, answers.callback(), 3 );
+  std::this_thread::sleep_for( 500ms );
+  std::atomic<int> requests{ 0 };
+  std::atomic<int64_t> request_timeout_ns{ 0 };
+  const auto late_service = fake_cm_node_->create_service<SwitchController>(
+      manager + "/switch_controller", [&]( const SwitchController::Request::SharedPtr request,
+                                           SwitchController::Response::SharedPtr response ) {
+        request_timeout_ns = rclcpp::Duration( request->timeout ).nanoseconds();
+        requests++;
+        response->ok = true;
+      } );
+
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_TRUE( answers.first().first ) << answers.first().second;
+  EXPECT_EQ( requests.load(), 1 );
+  EXPECT_LT( request_timeout_ns.load(), rclcpp::Duration( 2500ms ).nanoseconds() )
+      << "the wait is part of the timeout";
+  EXPECT_GT( request_timeout_ns.load(), 0 );
 }
 
 TEST_F( FakeControllerManagerTest, AnOrchestratorNotOwnedByASharedPtrAnswers )

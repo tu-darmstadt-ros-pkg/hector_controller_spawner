@@ -61,8 +61,9 @@ public:
    * @param activate_controllers List of controllers to activate.
    * @param callback Called exactly once with (success, the controller manager's message), unless
    * the orchestrator is destroyed first. Called with false if no answer arrives in time.
-   * @param timeout_s The timeout of the whole switch in seconds, sent as the request's timeout.
-   * The callback gets false if no answer arrives within one second more.
+   * @param timeout_s The timeout of the whole switch in seconds. A service not yet discovered is
+   * waited for within it, and the request carries what is left as its timeout. The callback gets
+   * false if no answer arrives within one second more.
    */
   void smartSwitchControllerAsync( const std::vector<std::string> &activate_controllers,
                                    const Callback &callback, int timeout_s = 5 ) const;

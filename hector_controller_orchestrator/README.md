@@ -81,9 +81,10 @@ orchestrator->smartSwitchControllerAsync(target_controllers,
 ```
 
 The callback fires exactly once, unless the orchestrator is destroyed first, with the controller
-manager's answer and message. It also fires when the service is not available. `timeout_s`
-(default 5 s) bounds the whole switch: the request carries it as its timeout, and if no answer
-arrives within one second more, the callback gets `false`.
+manager's answer and message. `timeout_s` (default 5 s) bounds the whole switch: a service not yet
+discovered is waited for within it, the request carries what is left as its timeout, and if no
+answer arrives within one second more, the callback gets `false`, also when the service never
+appeared.
 
 The blocking call waits up to `timeout_s` for the service and then up to `timeout_s` plus one
 second for the answer.

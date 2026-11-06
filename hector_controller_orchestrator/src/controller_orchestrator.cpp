@@ -7,6 +7,7 @@
 #include <lifecycle_msgs/msg/state.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_set>
@@ -26,13 +27,16 @@ using ControllerManagerActivity = controller_manager_msgs::msg::ControllerManage
 /// much longer before it gives up on an answer.
 constexpr std::chrono::seconds kAnswerMargin{ 1 };
 
+/// How often an async switch checks whether the service has been discovered.
+constexpr std::chrono::milliseconds kDiscoveryPoll{ 50 };
+
 std::shared_ptr<SwitchController::Request> forceAutoRequest( const std::vector<std::string> &activate,
-                                                             int timeout_s )
+                                                             const rclcpp::Duration &timeout )
 {
   auto request = std::make_shared<SwitchController::Request>();
   request->activate_controllers = activate;
   request->strictness = SwitchController::Request::FORCE_AUTO;
-  request->timeout = rclcpp::Duration( std::chrono::seconds( timeout_s ) );
+  request->timeout = timeout;
   return request;
 }
 
@@ -96,16 +100,27 @@ struct PendingSwitch {
       if ( answered )
         return;
       answered = true;
-      if ( timer )
-        timer->cancel();
+      if ( deadline )
+        deadline->cancel();
+      stopDiscoveryLocked();
     }
     callback( success, message );
+  }
+
+  void stopDiscoveryLocked()
+  {
+    if ( discovery )
+      discovery->cancel();
+    discovery.reset();
   }
 
   const Callback callback;
   std::mutex mutex;
   bool answered{ false };
-  rclcpp::TimerBase::SharedPtr timer;
+  std::optional<int64_t> request_id;
+  rclcpp::TimerBase::SharedPtr deadline;
+  /// Waits for the service and owns this switch until the request is sent.
+  rclcpp::TimerBase::SharedPtr discovery;
 };
 
 } // namespace
@@ -131,6 +146,8 @@ struct ControllerOrchestrator::Core : std::enable_shared_from_this<Core> {
   void subscribeToActivity( const rclcpp::Node::SharedPtr &node );
   void switchAsync( const std::vector<std::string> &activate, const Callback &callback,
                     int timeout_s );
+  void send( const std::shared_ptr<PendingSwitch> &pending,
+             const std::vector<std::string> &activate, const rclcpp::Duration &timeout );
   /// Wraps a user callback so it runs through the gate.
   Callback guarded( Callback callback );
   bool isActiveLocked( const std::string &controller_name ) const;
@@ -190,37 +207,76 @@ void ControllerOrchestrator::Core::switchAsync( const std::vector<std::string> &
     callback( true, "No controllers requested" );
     return;
   }
-  if ( !switch_controller_client_->service_is_ready() ) {
-    callback( false,
-              switch_controller_client_->get_service_name() + std::string( " is not available" ) );
-    return;
-  }
   const auto pending = std::make_shared<PendingSwitch>( callback );
-  const auto request = switch_controller_client_->async_send_request(
-      forceAutoRequest( activate, timeout_s ),
-      [pending]( rclcpp::Client<SwitchController>::SharedFuture future ) {
-        const auto response = future.get();
-        pending->answer( response->ok, response->message );
-      } );
-  const auto deadline = std::chrono::seconds( timeout_s ) + kAnswerMargin;
-  auto timer = rclcpp::create_wall_timer(
+  const auto timeout = std::chrono::seconds( timeout_s );
+  const auto deadline = timeout + kAnswerMargin;
+  auto deadline_timer = rclcpp::create_wall_timer(
       deadline,
       [weak_pending = std::weak_ptr<PendingSwitch>( pending ),
        weak_client = std::weak_ptr<rclcpp::Client<SwitchController>>( switch_controller_client_ ),
-       request_id = request.request_id, deadline]() {
+       deadline]() {
         // Taken first: the pending request owns it, and removing the request releases that
         const auto p = weak_pending.lock();
-        if ( const auto client = weak_client.lock() )
-          client->remove_pending_request( request_id );
-        if ( p )
-          p->answer( false, "The controller manager did not answer within " +
-                                std::to_string( deadline.count() ) + " s" );
+        if ( !p )
+          return;
+        std::optional<int64_t> request_id;
+        {
+          std::lock_guard<std::mutex> lock( p->mutex );
+          request_id = p->request_id;
+        }
+        const auto client = weak_client.lock();
+        if ( request_id && client )
+          client->remove_pending_request( *request_id );
+        p->answer( false, request_id ? "The controller manager did not answer within " +
+                                           std::to_string( deadline.count() ) + " s"
+                                     : ( client ? client->get_service_name() : std::string() ) +
+                                           std::string( " is not available" ) );
+      },
+      client_callback_group_, node_base_.get(), node_timers_.get() );
+  {
+    std::lock_guard<std::mutex> lock( pending->mutex );
+    pending->deadline = std::move( deadline_timer );
+  }
+  if ( switch_controller_client_->service_is_ready() ) {
+    send( pending, activate, timeout );
+    return;
+  }
+  // Polled, because rclcpp has no asynchronous wait for a service. The request gets what is left
+  // of the timeout, so the switch still ends at its deadline.
+  const auto start = std::chrono::steady_clock::now();
+  auto discovery = rclcpp::create_wall_timer(
+      kDiscoveryPoll,
+      [weak_core = weak_from_this(), pending, activate, start, timeout]() {
+        const auto core = weak_core.lock();
+        const auto left = start + timeout - std::chrono::steady_clock::now();
+        if ( core && core->switch_controller_client_->service_is_ready() && left > left.zero() )
+          core->send( pending, activate, rclcpp::Duration( left ) );
       },
       client_callback_group_, node_base_.get(), node_timers_.get() );
   std::lock_guard<std::mutex> lock( pending->mutex );
-  if ( pending->answered )
-    timer->cancel();
-  pending->timer = std::move( timer );
+  if ( !pending->answered )
+    pending->discovery = std::move( discovery );
+  else
+    discovery->cancel();
+}
+
+void ControllerOrchestrator::Core::send( const std::shared_ptr<PendingSwitch> &pending,
+                                         const std::vector<std::string> &activate,
+                                         const rclcpp::Duration &timeout )
+{
+  // Held while sending, so the deadline sees either no request or its id
+  std::lock_guard<std::mutex> lock( pending->mutex );
+  if ( pending->answered || pending->request_id )
+    return;
+  pending->stopDiscoveryLocked();
+  pending->request_id =
+      switch_controller_client_
+          ->async_send_request( forceAutoRequest( activate, timeout ),
+                                [pending]( rclcpp::Client<SwitchController>::SharedFuture future ) {
+                                  const auto response = future.get();
+                                  pending->answer( response->ok, response->message );
+                                } )
+          .request_id;
 }
 
 bool ControllerOrchestrator::Core::isActiveLocked( const std::string &controller_name ) const
@@ -248,7 +304,8 @@ bool ControllerOrchestrator::smartSwitchController( const std::vector<std::strin
     RCLCPP_ERROR( core_->logger_, "%s is not available.", client.get_service_name() );
     return false;
   }
-  auto future = client.async_send_request( forceAutoRequest( activate_controllers, timeout_s ) );
+  auto future = client.async_send_request(
+      forceAutoRequest( activate_controllers, std::chrono::seconds( timeout_s ) ) );
   // Never plain get(): the response comes through an executor thread this caller may occupy
   if ( future.wait_for( wait ) != std::future_status::ready ) {
     client.remove_pending_request( future );
