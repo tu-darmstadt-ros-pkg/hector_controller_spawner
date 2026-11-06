@@ -81,8 +81,20 @@ orchestrator->smartSwitchControllerAsync(target_controllers,
 ```
 
 The callback fires exactly once, unless the orchestrator is destroyed first, with the controller
-manager's answer and message. The request carries `timeout_s` (default 5 s) as its timeout; if no
-answer arrives within one second more, the callback gets `false`.
+manager's answer and message. It also fires when the service is not available. `timeout_s`
+(default 5 s) bounds the whole switch: the request carries it as its timeout, and if no answer
+arrives within one second more, the callback gets `false`.
+
+The blocking call waits up to `timeout_s` for the service and then up to `timeout_s` plus one
+second for the answer.
+
+### When a switch fails
+
+`false` does not always mean that nothing changed. A switch the controller manager refuses before
+it starts changes nothing. A switch that reaches its deadline keeps what it already stopped, and a
+start still under way can reach the hardware later (hcm's "Deadlines" rule). Without an answer the
+outcome is unknown. Read the states from `isControllerActive` or `areControllersActive` before you
+retry.
 
 ### Controller States
 

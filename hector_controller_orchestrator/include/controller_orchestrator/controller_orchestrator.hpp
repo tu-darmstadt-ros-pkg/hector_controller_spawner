@@ -48,8 +48,10 @@ public:
   /**
    * @brief Activates the given controllers in one FORCE_AUTO switch. Blocking.
    * @param activate_controllers List of controllers to activate.
-   * @param timeout_s The switch's timeout in seconds.
-   * @return true if the controller manager carried the switch out.
+   * @param timeout_s The switch's timeout in seconds. The call waits up to this long for the
+   * service, then up to this long plus one second for the answer.
+   * @return true if the controller manager carried the switch out. False does not mean nothing
+   * changed, see the README.
    */
   bool smartSwitchController( const std::vector<std::string> &activate_controllers,
                               int timeout_s = 10 ) const;
@@ -59,7 +61,8 @@ public:
    * @param activate_controllers List of controllers to activate.
    * @param callback Called exactly once with (success, the controller manager's message), unless
    * the orchestrator is destroyed first. Called with false if no answer arrives in time.
-   * @param timeout_s The switch's timeout in seconds.
+   * @param timeout_s The timeout of the whole switch in seconds, sent as the request's timeout.
+   * The callback gets false if no answer arrives within one second more.
    */
   void smartSwitchControllerAsync( const std::vector<std::string> &activate_controllers,
                                    const Callback &callback, int timeout_s = 5 ) const;
