@@ -306,6 +306,24 @@ TEST_F( StalledSwitchTest, AnOrchestratorCanBeDestroyedFromItsOwnCallback )
       << "destroying the orchestrator from its own callback did not return";
 }
 
+// Without a controller manager the callback still runs, once, with the reason
+TEST_F( FakeControllerManagerTest, AnAsyncSwitchWithoutAControllerManagerFailsOnce )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  controller_orchestrator::ControllerOrchestrator orphan( tester_node_, "/no_cm" );
+
+  Answers answers;
+  orphan.smartSwitchControllerAsync( { kController }, answers.callback(), 1 );
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_FALSE( answers.first().first );
+  EXPECT_NE( answers.first().second.find( "not available" ), std::string::npos )
+      << answers.first().second;
+
+  // Past the deadline, which must not answer a second time
+  std::this_thread::sleep_for( 2500ms );
+  EXPECT_EQ( answers.count(), 1u );
+}
+
 TEST_F( FakeControllerManagerTest, AnOrchestratorNotOwnedByASharedPtrAnswers )
 {
   hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
