@@ -89,6 +89,10 @@ appeared.
 The blocking call waits up to `timeout_s` for the service and then up to `timeout_s` plus one
 second for the answer.
 
+A node destroyed while a switch still waits for the service never runs that switch's timers again.
+The pending switch, its timers and its callback are then never freed, a few hundred bytes per such
+switch at shutdown, and the callback never runs.
+
 ### When a switch fails
 
 `false` does not always mean that nothing changed. A switch the controller manager refuses before
