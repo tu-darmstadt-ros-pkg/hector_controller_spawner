@@ -269,7 +269,9 @@ bool ControllerOrchestrator::smartSwitchController( const std::vector<std::strin
 void ControllerOrchestrator::smartSwitchControllerAsync(
     const std::vector<std::string> &activate_controllers, const Callback &callback, int timeout_s ) const
 {
-  core_->switchAsync( activate_controllers, core_->guarded( callback ), timeout_s );
+  // An answer can overtake this call, and its callback may destroy the orchestrator
+  const auto core = core_;
+  core->switchAsync( activate_controllers, core->guarded( callback ), timeout_s );
 }
 
 bool ControllerOrchestrator::isControllerActive( const std::string &controller_name ) const
