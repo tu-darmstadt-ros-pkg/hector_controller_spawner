@@ -19,8 +19,7 @@ find_package(controller_manager_msgs REQUIRED)
 # -------------------------------------------------------------------
 # 1) Build the controller_orchestrator library
 # -------------------------------------------------------------------
-add_library(${PROJECT_NAME} SHARED src/controller_orchestrator.cpp
-                                   src/controller_graph.cpp)
+add_library(${PROJECT_NAME} SHARED src/controller_orchestrator.cpp)
 
 target_include_directories(
   ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -28,15 +27,6 @@ target_include_directories(
 
 target_link_libraries(${PROJECT_NAME} PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS}
                                              ${controller_manager_msgs_TARGETS})
-
-# -------------------------------------------------------------------
-# 2) Create the 'controller_orchestrator_node' executable
-# -------------------------------------------------------------------
-add_executable(controller_orchestrator_node
-               src/controller_orchestrator_node.cpp)
-
-# Link against our library, which brings in the ROS 2 dependencies
-target_link_libraries(controller_orchestrator_node PRIVATE ${PROJECT_NAME})
 
 # -------------------------------------------------------------------
 # 3) Install rules
@@ -50,10 +40,6 @@ install(
   RUNTIME DESTINATION lib/${PROJECT_NAME} # libraries themselves go into lib;
                                           # executables into lib/<pkg>
 )
-
-# Install the node executable
-install(TARGETS controller_orchestrator_node
-        RUNTIME DESTINATION lib/${PROJECT_NAME})
 
 # Install headers
 install(DIRECTORY include/ DESTINATION include)
@@ -72,43 +58,20 @@ ament_export_targets(export_${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
-  find_package(ament_index_cpp REQUIRED)
-  find_package(controller_manager REQUIRED)
   find_package(hector_testing_utils REQUIRED)
   find_package(lifecycle_msgs REQUIRED)
-  find_package(realtime_tools REQUIRED)
-  find_package(hector_controller_spawner REQUIRED)
 
   ament_lint_auto_find_test_dependencies()
 
   ament_add_gtest(controller_orchestrator_test
-                  test/test_controller_orchestrator.cpp TIMEOUT 600)
-  target_compile_definitions(
-    controller_orchestrator_test
-    PRIVATE TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/config")
+                  test/test_controller_orchestrator.cpp TIMEOUT 120)
   target_link_libraries(
     controller_orchestrator_test
     ${PROJECT_NAME}
-    ament_index_cpp::ament_index_cpp
-    controller_manager::controller_manager
     ${controller_manager_msgs_TARGETS}
-    hector_controller_spawner::hector_controller_spawner_lib
     hector_testing_utils::hector_testing_utils
     ${lifecycle_msgs_TARGETS}
-    realtime_tools::realtime_tools
-    rclcpp::rclcpp
-    ${std_msgs_TARGETS})
-
-  ament_add_gtest(controller_graph_test test/test_controller_graph.cpp)
-  target_include_directories(controller_graph_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(controller_graph_test ${PROJECT_NAME})
-
-  ament_add_gtest(stale_switch_chain_test test/test_stale_switch_chain.cpp
-                  TIMEOUT 120)
-  target_link_libraries(
-    stale_switch_chain_test ${PROJECT_NAME} ${controller_manager_msgs_TARGETS}
-    hector_testing_utils::hector_testing_utils rclcpp::rclcpp)
+    rclcpp::rclcpp)
 endif()
 
 ament_package()
