@@ -15,11 +15,14 @@ namespace controller_orchestrator
 
 /**
  * @class ControllerOrchestrator
- * @brief A thin client of the controller manager's switch service.
+ * @brief Activates controllers together with the controllers they chain into, and stops what
+ * conflicts with them.
  *
- * A switch is one FORCE_AUTO request: the controller manager adds the providers the controllers
- * need and stops what conflicts with them, and answers with its reason when it refuses. The
- * controller states come from the manager's latest ~/activity message.
+ * A controller manager that declares "force_auto" in its capabilities parameter resolves that
+ * itself, so a switch is one FORCE_AUTO request. For any other, such as stock ros2_control, the
+ * orchestrator lists the controllers and sends one STRICT request with the activations and
+ * deactivations it planned. The capabilities are read once per controller manager. The controller
+ * states come from the manager's latest ~/activity message.
  *
  * Responses are delivered by the executor spinning the node. The blocking call waits for one, so
  * it needs another thread of that executor to be free.
@@ -46,10 +49,9 @@ public:
   ControllerOrchestrator &operator=( const ControllerOrchestrator & ) = delete;
 
   /**
-   * @brief Activates the given controllers in one FORCE_AUTO switch. Blocking.
+   * @brief Activates the given controllers. Blocking.
    * @param activate_controllers List of controllers to activate.
-   * @param timeout_s The switch's timeout in seconds. The call waits up to this long for the
-   * service, then up to this long plus one second for the answer.
+   * @param timeout_s The timeout of the whole switch in seconds, as for the async version.
    * @return true if the controller manager carried the switch out. False does not mean nothing
    * changed, see the README.
    */
@@ -61,9 +63,9 @@ public:
    * @param activate_controllers List of controllers to activate.
    * @param callback Called exactly once with (success, the controller manager's message), unless
    * the orchestrator is destroyed first. Called with false if no answer arrives in time.
-   * @param timeout_s The timeout of the whole switch in seconds. A service not yet discovered is
-   * waited for within it, and the request carries what is left as its timeout. The callback gets
-   * false if no answer arrives within one second more.
+   * @param timeout_s The timeout of the whole switch in seconds. Services not yet discovered are
+   * waited for within it, and the switch request carries what is left as its timeout. The
+   * callback gets false if no answer arrives within one second more.
    */
   void smartSwitchControllerAsync( const std::vector<std::string> &activate_controllers,
                                    const Callback &callback, int timeout_s = 5 ) const;

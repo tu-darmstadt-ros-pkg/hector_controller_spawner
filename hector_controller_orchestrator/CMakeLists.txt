@@ -15,18 +15,22 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 
 # -------------------------------------------------------------------
 # 1) Build the controller_orchestrator library
 # -------------------------------------------------------------------
-add_library(${PROJECT_NAME} SHARED src/controller_orchestrator.cpp)
+add_library(${PROJECT_NAME} SHARED src/controller_orchestrator.cpp
+                                   src/switch_plan.cpp)
 
 target_include_directories(
   ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
                          $<INSTALL_INTERFACE:include>)
 
-target_link_libraries(${PROJECT_NAME} PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS}
-                                             ${controller_manager_msgs_TARGETS})
+target_link_libraries(
+  ${PROJECT_NAME}
+  PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS} ${controller_manager_msgs_TARGETS}
+         ${rcl_interfaces_TARGETS})
 
 # -------------------------------------------------------------------
 # 3) Install rules
