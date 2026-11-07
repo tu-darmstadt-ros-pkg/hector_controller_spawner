@@ -3,7 +3,7 @@
 
 Toolkit containing:
 - **Hector Controller Spawner (Multispawner):** One-shot launcher that loads/activates hardware and controllers with chaining, retries, and optional e-stop gating.
-- **Hector Controller Orchestrator:** thin C++ client that asks the controller manager for one FORCE_AUTO switch. See [hector_controller_orchestrator/README.md](hector_controller_orchestrator/README.md).
+- **Hector Controller Orchestrator:** thin C++ client that asks `hector_controller_manager` for one FORCE_AUTO switch. See [hector_controller_orchestrator/README.md](hector_controller_orchestrator/README.md).
 ---
 ## Hector Controller Spawner – **Multispawner**
 
@@ -58,7 +58,10 @@ ros2 launch hector_controller_spawner hector_controller_spawner_launch.yml
 
 ---
 # Hector Controller Orchestrator
-Thin C++ client of the controller manager's `switch_controller` service:
+Thin C++ client of the controller manager's `switch_controller` service. It requires
+`hector_controller_manager`, because the stock ros2_control controller manager runs FORCE_AUTO as
+BEST_EFFORT and can answer ok after skipping controllers.
+
 - A switch is one FORCE_AUTO request; the controller manager resolves chains and conflicts and answers with its reason.
 - Provides synchronous and asynchronous APIs; the async variant is safe for single-threaded executors.
 - Reports controller states from the manager's latest `~/activity` message.

@@ -7,6 +7,10 @@ stops what conflicts with them, and answers with its reason when it refuses, for
 protected controller in the way or an engaged e-stop. The controller states come from the manager's
 latest `~/activity` message.
 
+**Requires `hector_controller_manager`.** The stock ros2_control controller manager runs a
+FORCE_AUTO request as BEST_EFFORT. It then neither starts the providers nor stops the conflicts,
+and it can answer ok although it skipped controllers you asked for.
+
 ## Usage
 
 ### Class Integration (as a Node Member)
@@ -97,9 +101,8 @@ switch at shutdown, and the callback never runs.
 
 `false` does not always mean that nothing changed. A switch the controller manager refuses before
 it starts changes nothing. A switch that reaches its deadline keeps what it already stopped, and a
-start still under way can reach the hardware later (hcm's "Deadlines" rule). Without an answer the
-outcome is unknown. Read the states from `isControllerActive` or `areControllersActive` before you
-retry.
+start still under way can reach the hardware later. Without an answer the outcome is unknown.
+Read the states from `isControllerActive` or `areControllersActive` before you retry.
 
 ### Controller States
 
