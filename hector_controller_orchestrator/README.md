@@ -1,15 +1,36 @@
 # hector_controller_orchestrator
 
-The `hector_controller_orchestrator` package is a thin C++ client of the controller manager's
-`switch_controller` service. A switch is one FORCE_AUTO request that names the controllers to
-activate. The controller manager (`hector_controller_manager`) adds the providers they chain into,
-stops what conflicts with them, and answers with its reason when it refuses, for example a
-protected controller in the way or an engaged e-stop. The controller states come from the manager's
-latest `~/activity` message.
+The `hector_controller_orchestrator` package is a C++ client of the controller manager's
+`switch_controller` service. You name the controllers you want active. The controllers they chain
+into are started with them, and every active controller that claims an interface they need is
+stopped, together with the controllers chained into it. The controller states come from the
+manager's latest `~/activity` message.
 
-**Requires `hector_controller_manager`.** The stock ros2_control controller manager runs a
-FORCE_AUTO request as BEST_EFFORT. It then neither starts the providers nor stops the conflicts,
-and it can answer ok although it skipped controllers you asked for.
+## Supported controller managers
+
+Both `hector_controller_manager` and the stock ros2_control controller manager work. Before the
+first switch the orchestrator reads the manager's `capabilities` parameter through
+`<manager>/get_parameters` and logs which mode it uses.
+
+- **`capabilities` contains `force_auto`** (hector_controller_manager). A switch is one FORCE_AUTO
+  request. The manager resolves chains and conflicts and answers with its reason when it refuses,
+  for example a protected controller in the way or an engaged e-stop.
+- **Anything else, or no such parameter** (stock ros2_control, which runs FORCE_AUTO as
+  BEST_EFFORT). The orchestrator calls `list_controllers`, plans the activations and deactivations
+  itself and sends them as one STRICT request, which the manager checks as a whole and refuses
+  if any part fails.
+
+The parameter is read again when a restarted manager publishes its activity.
+
+On stock ros2_control a few things are worth knowing:
+
+- A requested controller that is not loaded or not configured fails the switch before anything is
+  sent.
+- The plan comes from one listing. If the manager changes in between, for example through another
+  switch still in flight, the STRICT request is refused and the switch fails. Retry it if that
+  matters.
+- A requested controller that is already active is not sent again. If someone stops it between the
+  listing and the switch, the switch can still answer ok.
 
 ## Usage
 
@@ -62,7 +83,7 @@ auto orchestrator = std::make_shared<controller_orchestrator::ControllerOrchestr
 
 ### Smart Switching
 
-The primary function of this library is `smartSwitchController`. You name the controllers you *want* to be active, and the controller manager figures out the rest in one FORCE_AUTO switch.
+The primary function of this library is `smartSwitchController`. You name the controllers you *want* to be active, and the rest is figured out as described above.
 
 #### Synchronous (Blocking)
 ```cpp
@@ -85,13 +106,12 @@ orchestrator->smartSwitchControllerAsync(target_controllers,
 ```
 
 The callback fires exactly once, unless the orchestrator is destroyed first, with the controller
-manager's answer and message. `timeout_s` (default 5 s) bounds the whole switch: a service not yet
-discovered is waited for within it, the request carries what is left as its timeout, and if no
-answer arrives within one second more, the callback gets `false`, also when the service never
-appeared.
+manager's answer and message, or with the reason the orchestrator refused. `timeout_s` (default
+5 s) bounds the whole switch. Services not yet discovered are waited for within it, the switch
+request carries what is left as its timeout, and if no answer arrives within one second more, the
+callback gets `false`, also when the services never appeared.
 
-The blocking call waits up to `timeout_s` for the service and then up to `timeout_s` plus one
-second for the answer.
+The blocking call runs the same switch and waits for its answer.
 
 A node destroyed while a switch still waits for the service never runs that switch's timers again.
 The pending switch, its timers and its callback are then never freed, a few hundred bytes per such
@@ -112,4 +132,5 @@ the controller manager latches, so an orchestrator built after bring-up knows th
 ## Dependencies
 
 - `rclcpp`
+- `rcl_interfaces`
 - `controller_manager_msgs`
