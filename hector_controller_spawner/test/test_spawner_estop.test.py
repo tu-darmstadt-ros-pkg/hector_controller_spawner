@@ -4,6 +4,7 @@ import time
 from ament_index_python.packages import get_package_share_directory
 import launch
 import launch.actions
+import launch.substitutions
 import launch_ros.actions
 import launch_testing
 import launch_testing.actions
@@ -45,7 +46,7 @@ def generate_test_description():
     )
 
     controller_manager = launch_ros.actions.Node(
-        package="controller_manager",
+        package=launch.substitutions.LaunchConfiguration("cm_package"),
         executable="ros2_control_node",
         output="screen",
         parameters=[controller_config],
@@ -56,12 +57,16 @@ def generate_test_description():
         package="hector_controller_spawner",
         executable="hector_controller_spawner",
         output="screen",
+        # Neither manager passes its own parameter file on to the controllers
         parameters=[spawner_config, {"controller_param_files": [controller_config]}],
     )
 
     return (
         launch.LaunchDescription(
             [
+                launch.actions.DeclareLaunchArgument(
+                    "cm_package", default_value="controller_manager"
+                ),
                 robot_state_publisher,
                 controller_manager,
                 launch.actions.TimerAction(period=3.0, actions=[spawner_node]),

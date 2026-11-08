@@ -40,13 +40,21 @@ if(BUILD_TESTING)
 
   # for ROS 2 launch‐testing
   find_package(launch_testing_ament_cmake REQUIRED)
-  # This will install and run your test/controller_spawner_launch.py
-  add_launch_test(test/test_spawner_basic.test.py TIMEOUT 360)
-  add_launch_test(test/test_spawner_twice.test.py TIMEOUT 360)
-  add_launch_test(test/test_spawner_estop.test.py TIMEOUT 360)
-  add_launch_test(test/test_spawner_chain_detection.test.py TIMEOUT 360)
-  add_launch_test(test/test_spawner_multiple_chained.test.py TIMEOUT 360)
-  add_launch_test(test/test_spawner_start_partial_chain.test.py TIMEOUT 360)
+  # The tests against a real manager run against both managers the spawner
+  # supports
+  foreach(cm_package controller_manager hector_controller_manager)
+    foreach(test basic twice estop chain_detection multiple_chained
+                 start_partial_chain)
+      add_launch_test(
+        test/test_spawner_${test}.test.py
+        TARGET
+        test_spawner_${test}_${cm_package}
+        ARGS
+        cm_package:=${cm_package}
+        TIMEOUT
+        360)
+    endforeach()
+  endforeach()
   add_launch_test(test/test_spawner_degraded_cm.test.py TIMEOUT 360)
   add_launch_test(test/test_spawner_controllers_torn_down.test.py TIMEOUT 360)
   add_launch_test(test/test_spawner_retry_without_estop.test.py TIMEOUT 360)
