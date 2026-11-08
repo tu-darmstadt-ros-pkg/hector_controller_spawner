@@ -95,7 +95,7 @@ class FakeControllerManager(Node):
     def _gate(self, service_name):
         """Returns False when this call must never be answered."""
         if service_name in self.never_answer:
-            self.get_logger().warn(f"swallowing a {service_name} request")
+            self.get_logger().warning(f"swallowing a {service_name} request")
             return False
         with self._lock:
             first_call = (
@@ -107,7 +107,7 @@ class FakeControllerManager(Node):
         if first_call:
             # Answered, but only after the caller's own timeout has passed. Blocking for good
             # instead would wedge the node: every service here shares one callback group.
-            self.get_logger().warn(f"stalling the first {service_name} request")
+            self.get_logger().warning(f"stalling the first {service_name} request")
             threading.Event().wait(self.stall_first_sec)
         if self.answer_delay_sec > 0.0:
             threading.Event().wait(self.answer_delay_sec)
@@ -140,7 +140,7 @@ class FakeControllerManager(Node):
         with self._lock:
             self._list_calls += 1
             if self.drop_first_list and self._list_calls == 1:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     "answering the first list_controllers with nothing"
                 )
                 return response

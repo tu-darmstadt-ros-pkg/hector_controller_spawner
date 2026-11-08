@@ -260,7 +260,7 @@ class TestEStopFunctionality(unittest.TestCase):
         )
 
         if not client.wait_for_service(timeout_sec=3.0):
-            self.node.get_logger().warn("Hardware components service not available")
+            self.node.get_logger().warning("Hardware components service not available")
             return []
 
         request = ListHardwareComponents.Request()
@@ -277,7 +277,7 @@ class TestEStopFunctionality(unittest.TestCase):
         )
 
         if not client.wait_for_service(timeout_sec=3.0):
-            self.node.get_logger().warn("Controller manager service not available")
+            self.node.get_logger().warning("Controller manager service not available")
             return []
 
         request = ListControllers.Request()
