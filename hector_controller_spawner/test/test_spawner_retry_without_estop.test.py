@@ -77,7 +77,9 @@ class TestRetryWithoutEStop(unittest.TestCase):
         cls.node.destroy_node()
         rclpy.shutdown()
 
-    def test_the_attempt_that_gave_up_is_run_again(self, proc_output, spawner_node):
+    def test_the_attempt_that_gave_up_is_run_again(
+        self, proc_output, proc_info, spawner_node
+    ):
         proc_output.assertWaitFor(
             "Retrying the startup sequence", process=spawner_node, timeout=30
         )
@@ -101,6 +103,8 @@ class TestRetryWithoutEStop(unittest.TestCase):
             "The spawner stopped after the attempt it abandoned, so nothing was activated: "
             f"{states}",
         )
+        # Shutting the launch down while the spawner still exits on its own interrupts it
+        proc_info.assertWaitForShutdown(process=spawner_node, timeout=10)
 
 
 @launch_testing.post_shutdown_test()
