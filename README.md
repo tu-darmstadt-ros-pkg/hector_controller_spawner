@@ -36,6 +36,7 @@ ready to go with minimal configuration.
 | `hardware_interfaces`            | `string[]` | -       | Ordered list of hardware interface names to activate.                     |
 | `controllers`                    | `string[]` | -       | Ordered list of controller names to load and manage.                      |
 | `<ctrl>.activate`                | `bool`     | `true`  | Should the controller be activated after loading?                         |
+| `controller_param_files`         | `string[]` | `[]`    | Parameter files of the controllers. Set as `<ctrl>.params_file` on the manager, the only way either manager passes parameters on to a controller. |
 | `retry_delay`                    | `double`   | `5.0`   | Delay (in seconds) between retry attempts.                                |
 | `start_delay`                     | `double`   | `0.0`   | Initial delay (in seconds) before starting the spawner process.           |
 | `service_call_timeout_ms`         | `int`      | `5000`  | Timeout (in milliseconds) for service calls to the controller manager.    |
@@ -53,6 +54,7 @@ ros2 launch hector_controller_spawner hector_controller_spawner_launch.yml
 ```
 
 * Include **only once** in your launch setup.
+* Works with `controller_manager` and `hector_controller_manager`. Do not run it next to a `hector_controller_manager` that has `estop_topics` or `startup.*` configured, because the manager's own autostart after a release races the spawner.
 * No need for individual `spawner` calls per controller.
 
 

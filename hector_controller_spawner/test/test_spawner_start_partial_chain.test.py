@@ -142,6 +142,10 @@ class TestControllerSpawner(unittest.TestCase):
             self.assertIn(controller, loaded_controllers)
             self.assertEqual(loaded_controllers[controller], "inactive")
 
+    def test_spawner_exits_by_itself(self, proc_info, spawner_node):
+        # Shutting the launch down while the spawner still exits on its own interrupts it
+        proc_info.assertWaitForShutdown(process=spawner_node, timeout=10)
+
 
 @launch_testing.post_shutdown_test()
 class TestProcessOutput(unittest.TestCase):

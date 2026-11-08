@@ -40,8 +40,8 @@ if(BUILD_TESTING)
 
   # for ROS 2 launch‐testing
   find_package(launch_testing_ament_cmake REQUIRED)
-  # The tests against a real manager run against both managers the spawner
-  # supports
+  # The spawner talks to both managers, which answer the same services
+  # differently
   foreach(cm_package controller_manager hector_controller_manager)
     foreach(test basic twice estop chain_detection multiple_chained
                  start_partial_chain)
