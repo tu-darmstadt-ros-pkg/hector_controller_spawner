@@ -14,6 +14,7 @@ called_from_lib:librmw_dds_common.so
 called_from_lib:librmw_cyclonedds_cpp.so
 called_from_lib:librmw_implementation.so
 called_from_lib:librmw.so
+# Also hides a real Cyclone 11.0.1 typelib race, ddsi_topic_descriptor_from_type walks gv->typedeps unlocked during concurrent entity creation.
 called_from_lib:libddsc.so
 
 # --- Fast-DDS ---------------------------------------------------------------
@@ -86,10 +87,3 @@ called_from_lib:libposition_controllers.so
 called_from_lib:libvelocity_controllers.so
 called_from_lib:librosidl_runtime_c.so
 called_from_lib:libtransmission_interface.so
-called_from_lib:libhector_transmission_interface.so
-# hector_ros_controllers, which the chained-controller config loads three controllers from. Named
-# by module rather than by the realtime_tools mutex above, because CI builds this dependency from
-# source without -g and the frames carry no symbol to match. It names its plugin library plain
-# "controllers", so the module name is as specific as this entry can be; pluginlib warns about that
-# name on every load.
-called_from_lib:libcontrollers.so
