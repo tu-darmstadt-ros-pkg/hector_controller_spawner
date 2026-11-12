@@ -323,7 +323,8 @@ TEST_F( StalledSwitchTest, ABlockingSwitchGivesUpAfterItsTimeout )
 
   const auto start = std::chrono::steady_clock::now();
   EXPECT_FALSE( orchestrator_->smartSwitchController( { kController }, 1 ) );
-  EXPECT_LT( std::chrono::steady_clock::now() - start, 3s );
+  // The timeout of 1 s plus the 2 s answer margin, with 1 s to spare
+  EXPECT_LT( std::chrono::steady_clock::now() - start, 4s );
 }
 
 TEST_F( StalledSwitchTest, DestructionWaitsForACallbackInProgress )

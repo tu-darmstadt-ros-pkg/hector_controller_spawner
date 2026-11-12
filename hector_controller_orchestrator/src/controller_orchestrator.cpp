@@ -32,9 +32,9 @@ using GetParameters = rcl_interfaces::srv::GetParameters;
 using ControllerManagerActivity = controller_manager_msgs::msg::ControllerManagerActivity;
 using PublisherGid = std::array<uint8_t, RMW_GID_STORAGE_SIZE>;
 
-/// The controller manager answers within a switch's timeout plus 500 ms, so a caller waits this
-/// much longer before it gives up on an answer.
-constexpr std::chrono::seconds kAnswerMargin{ 1 };
+/// The controller manager answers within a switch's timeout plus one mode switch and its grace
+/// (1.4 s with the defaults), so a caller waits this much longer before it gives up on an answer.
+constexpr std::chrono::seconds kAnswerMargin{ 2 };
 
 /// How often an async switch checks whether the services have been discovered.
 constexpr std::chrono::milliseconds kDiscoveryPoll{ 50 };
