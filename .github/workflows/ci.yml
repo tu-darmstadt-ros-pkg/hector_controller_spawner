@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - lyrical
+    - lyrical
   pull_request:
 
 jobs:
