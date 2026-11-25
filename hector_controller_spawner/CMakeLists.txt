@@ -31,8 +31,8 @@ target_link_libraries(
          hector_ros2_utils::hector_ros2_utils)
 
 add_executable(hector_controller_spawner src/hector_controller_spawner_main.cpp)
-target_link_libraries(hector_controller_spawner PRIVATE
-                      hector_controller_spawner_lib)
+target_link_libraries(hector_controller_spawner
+                      PRIVATE hector_controller_spawner_lib)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

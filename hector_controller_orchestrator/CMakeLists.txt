@@ -25,9 +25,8 @@ target_include_directories(
   ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
                          $<INSTALL_INTERFACE:include>)
 
-target_link_libraries(
-  ${PROJECT_NAME} PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS}
-                         ${controller_manager_msgs_TARGETS})
+target_link_libraries(${PROJECT_NAME} PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS}
+                                             ${controller_manager_msgs_TARGETS})
 
 # -------------------------------------------------------------------
 # 2) Create the 'controller_orchestrator_node' executable

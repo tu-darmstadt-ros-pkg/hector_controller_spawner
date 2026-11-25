@@ -361,6 +361,8 @@ protected:
   {
     auto spawner_options = hector_testing_utils::node_options_from_yaml( spawner_yaml_ );
     spawner_options.automatically_declare_parameters_from_overrides( false );
+    spawner_options.append_parameter_override( "controller_param_files",
+                                               std::vector<std::string>{ controllers_yaml_ } );
     spawner_node_ = std::make_shared<hector_controller_spawner::MultiSpawner>( spawner_options );
     spawner_node_->initialize();
     spawner_node_->start_sequence( true );

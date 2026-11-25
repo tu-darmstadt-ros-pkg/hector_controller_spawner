@@ -78,6 +78,9 @@ class TestControllerSpawnerIdempotency(unittest.TestCase):
         spawner_config = os.path.join(
             pkg_share, "test", "config", "controller_spawner.yaml"
         )
+        controller_config = os.path.join(
+            pkg_share, "test", "config", "controllers.yaml"
+        )
 
         # Spawner command
         cmd = [
@@ -88,6 +91,8 @@ class TestControllerSpawnerIdempotency(unittest.TestCase):
             "--ros-args",
             "--params-file",
             spawner_config,
+            "-p",
+            f"controller_param_files:=[{controller_config}]",
         ]
 
         # 1. Check initial state (no controllers loaded)

@@ -56,7 +56,7 @@ def generate_test_description():
         package="hector_controller_spawner",
         executable="hector_controller_spawner",
         output="screen",
-        parameters=[spawner_config],
+        parameters=[spawner_config, {"controller_param_files": [controller_config]}],
     )
 
     return (
