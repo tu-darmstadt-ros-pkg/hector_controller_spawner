@@ -20,7 +20,7 @@
         type: joint_trajectory_controller/JointTrajectoryController
 
       vel_to_pos_controller:
-        type: velocity_to_position_command_controller/VelocityToPositionCommandController
+        type: sync_group_velocity_to_position_controller/SyncGroupVelocityToPositionController
 
       flipper_safety_position_controller:
         # type: safety_position_controller/SafetyPositionController
@@ -63,7 +63,6 @@
       - flipper_bl_joint
       - flipper_br_joint
 
-      e_stop_topic: estop_board/hard_estop
       passthrough_controller: flipper_safety_position_controller
 
 
