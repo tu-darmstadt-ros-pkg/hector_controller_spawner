@@ -3,6 +3,7 @@ import unittest
 from ament_index_python.packages import get_package_share_directory
 import launch
 import launch.actions
+import launch.substitutions
 import launch_ros.actions
 import launch_testing
 import launch_testing.actions
@@ -39,7 +40,7 @@ def generate_test_description():
     )
 
     controller_manager = launch_ros.actions.Node(
-        package="controller_manager",
+        package=launch.substitutions.LaunchConfiguration("cm_package"),
         executable="ros2_control_node",
         output="screen",
         parameters=[controller_config],
@@ -49,12 +50,16 @@ def generate_test_description():
         package="hector_controller_spawner",
         executable="hector_controller_spawner",
         output="screen",
+        # Neither manager passes its own parameter file on to the controllers
         parameters=[spawner_config, {"controller_param_files": [controller_config]}],
     )
 
     return (
         launch.LaunchDescription(
             [
+                launch.actions.DeclareLaunchArgument(
+                    "cm_package", default_value="controller_manager"
+                ),
                 robot_state_publisher,
                 controller_manager,
                 launch.actions.TimerAction(period=5.0, actions=[spawner_node]),
@@ -136,6 +141,10 @@ class TestControllerSpawner(unittest.TestCase):
         for controller in expected_inactive:
             self.assertIn(controller, loaded_controllers)
             self.assertEqual(loaded_controllers[controller], "inactive")
+
+    def test_spawner_exits_by_itself(self, proc_info, spawner_node):
+        # Shutting the launch down while the spawner still exits on its own interrupts it
+        proc_info.assertWaitForShutdown(process=spawner_node, timeout=10)
 
 
 @launch_testing.post_shutdown_test()

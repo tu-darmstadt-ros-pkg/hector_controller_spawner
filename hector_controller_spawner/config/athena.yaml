@@ -10,7 +10,7 @@
     start_delay: 0.0
 
     # Timeout for service calls to the controller manager in milliseconds.
-    srv_call_timeout_ms: 5.0
+    service_call_timeout_ms: 5000
 
     # ---------- hardware interfaces (activate = always) ----------
     hardware_interfaces:

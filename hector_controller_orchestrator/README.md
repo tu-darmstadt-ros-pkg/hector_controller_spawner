@@ -1,26 +1,52 @@
 # hector_controller_orchestrator
 
-The `hector_controller_orchestrator` package provides a C++ library to simplify complex controller management tasks in ROS 2 `ros2_control` systems. It specializes in handling controller switching while automatically resolving resource conflicts and dependency chains.
+The `hector_controller_orchestrator` package is a C++ client of the controller manager's
+`switch_controller` service. You name the controllers you want active. The controllers they chain
+into are started with them, and every active controller that claims an interface they need is
+stopped, together with the controllers chained into it. The controller states come from the
+manager's latest `~/activity` message.
 
-## Key Features
+## Supported controller managers
 
-- **Smart Switching**: Automatically identifies and stops active controllers that conflict with requested ones.
-- **Dependency Resolution**: Handles chained controllers by ensuring that when a parent controller is stopped, its dependents are also stopped, and vice versa for starting.
-- **Async & Sync API**: Offers both blocking (synchronous) and non-blocking (asynchronous) methods for integration into various node execution models.
-- **State Caching**: Maintains an internal cache of controller states (updated via `controller_manager/activity` or manual refresh) to minimize service call latency.
+Both `hector_controller_manager` and the stock ros2_control controller manager work. Before the
+first switch the orchestrator reads the manager's `capabilities` parameter through
+`<manager>/get_parameters` and logs which mode it uses.
+
+- **`capabilities` contains `force_auto`** (hector_controller_manager). A switch is one FORCE_AUTO
+  request. The manager resolves chains and conflicts and answers with its reason when it refuses,
+  for example a protected controller in the way or an engaged e-stop.
+- **Anything else, or no such parameter** (stock ros2_control, which runs FORCE_AUTO as
+  BEST_EFFORT). The orchestrator calls `list_controllers`, plans the activations and deactivations
+  itself and sends them as one STRICT request, which the manager checks as a whole and refuses
+  if any part fails.
+
+The parameter is read again when a restarted manager publishes its activity.
+
+On stock ros2_control a few things are worth knowing:
+
+- A requested controller that is not loaded or not configured fails the switch before anything is
+  sent.
+- The plan comes from one listing. If the manager changes in between, for example through another
+  switch still in flight, the STRICT request is refused and the switch fails. Retry it if that
+  matters.
+- A requested controller that is already active is not sent again. If someone stops it between the
+  listing and the switch, the switch can still answer ok.
 
 ## Usage
 
 ### Class Integration (as a Node Member)
 
-Create the orchestrator as a `shared_ptr` member of your node class. Pass your node (or `shared_from_this()`) and optionally the controller manager name (defaults to `controller_manager`).
+Pass your node and optionally the controller manager name (defaults to `controller_manager`). The orchestrator does not keep the node alive, so the node can own it. It works as a plain member, a `shared_ptr` or on the stack.
 
 ```cpp
 #include <controller_orchestrator/controller_orchestrator.hpp>
 
 class MyNode : public rclcpp::Node {
 public:
-    MyNode() : rclcpp::Node("my_node") {
+    MyNode() : rclcpp::Node("my_node") {}
+
+    // shared_from_this() is not available in the constructor
+    void init() {
         orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
                 shared_from_this());
     }
@@ -30,16 +56,18 @@ private:
 };
 ```
 
+When the destructor returns, no callback of the orchestrator is running or will run. It waits for callbacks in progress on other threads, so a callback may capture `this` of the owner. A callback may also destroy the orchestrator itself.
+
 ### ⚠️ Important: Executor Requirements for Blocking Functions
 
-**Most functions in this library are blocking** and internally wait for service responses. They **cannot be called from within a callback** if your node uses a `SingleThreadedExecutor`, as this will cause a deadlock (the executor cannot process the service response while waiting in the callback).
+`smartSwitchController` is blocking and waits for the service response. It **cannot be called from within a callback** if your node uses a `SingleThreadedExecutor`, as this will cause a deadlock (the executor cannot process the service response while waiting in the callback).
 
 **Solutions:**
 - Use `MultiThreadedExecutor` or `StaticMultiThreadedExecutor` for your node
 - Use the asynchronous variants (e.g., `smartSwitchControllerAsync`) which are safe for single-threaded executors
 - Call blocking functions from a separate thread
 
-**Safe for SingleThreadedExecutor:** `smartSwitchControllerAsync`, `refreshControllerStatesAsync`
+**Safe for SingleThreadedExecutor:** `smartSwitchControllerAsync`, `isControllerActive`, `areControllersActive`
 
 
 ### Initialization
@@ -55,7 +83,7 @@ auto orchestrator = std::make_shared<controller_orchestrator::ControllerOrchestr
 
 ### Smart Switching
 
-The primary function of this library is `smartSwitchController`. You specify which controllers you *want* to be active, and the orchestrator figures out the rest.
+The primary function of this library is `smartSwitchController`. You name the controllers you *want* to be active, and the rest is figured out as described above.
 
 #### Synchronous (Blocking)
 ```cpp
@@ -77,72 +105,32 @@ orchestrator->smartSwitchControllerAsync(target_controllers,
     });
 ```
 
-### How "Smart Switch" Works
+The callback fires exactly once, unless the orchestrator is destroyed first, with the controller
+manager's answer and message, or with the reason the orchestrator refused. `timeout_s` (default
+5 s) bounds the whole switch. Services not yet discovered are waited for within it, the switch
+request carries what is left as its timeout, and if no answer arrives within one second more, the
+callback gets `false`, also when the services never appeared.
 
-1. **Dependency Expansion**: If you request controller A, and A depends on B (chained), the orchestrator automatically adds B to the activation list.
-2. **Conflict Detection**: It checks which resources (joints/interfaces) the requested controllers need. If an currently active controller C uses any of those resources, C is marked for deactivation.
-3. **Ripple Deactivation**: If C is marked for deactivation, any controller D that depends on C is also marked for deactivation.
-4. **Topological Ordering**: The orchestrator calculates the correct sequence for stopping and starting. For example, it stops dependents *before* dependencies and starts dependencies *before* dependents.
+The blocking call runs the same switch and waits for its answer.
 
-### Manual Controller Activation/Deactivation
+A node destroyed while a switch still waits for the service never runs that switch's timers again.
+The pending switch, its timers and its callback are then never freed, a few hundred bytes per such
+switch at shutdown, and the callback never runs.
 
-For direct control without the smart switching logic, you can use:
+### When a switch fails
 
-#### Activate Controllers
-```cpp
-std::vector<std::string> controllers = {"controller1", "controller2"};
-bool success = orchestrator->activateControllers(controllers, timeout_s);
-```
+`false` does not always mean that nothing changed. A switch the controller manager refuses before
+it starts changes nothing. A switch that reaches its deadline keeps what it already stopped, and a
+start still under way can reach the hardware later. Without an answer the outcome is unknown.
+Read the states from `isControllerActive` or `areControllersActive` before you retry.
 
-#### Deactivate Controllers
-```cpp
-std::vector<std::string> controllers = {"controller1", "controller2"};
-bool success = orchestrator->deactivateControllers(controllers, timeout_s);
-```
+### Controller States
 
-**⚠️ Warning**: These are blocking calls. Do not use in SingleThreadedExecutor callbacks.
-
-**Note**: These methods do not handle dependencies or conflicts—they simply activate or deactivate the specified controllers in the order provided.
-
-### Hardware Interface Management
-
-#### Get Active Controllers for Hardware Interface
-Find all active controllers that claim a specific hardware interface:
-
-```cpp
-std::string hardware_interface = "joint1";
-std::vector<std::string> active_controllers =
-    orchestrator->getActiveControllerOfHardwareInterface(hardware_interface, timeout_s);
-
-for (const auto& ctrl : active_controllers) {
-    RCLCPP_INFO(rclcpp::get_logger("my_node"),
-                "Controller %s is using %s", ctrl.c_str(), hardware_interface.c_str());
-}
-```
-
-**⚠️ Warning**: This is a blocking call. Do not use in SingleThreadedExecutor callbacks.
-
-This is useful for determining which controllers need to be stopped before performing maintenance or switching to a different control strategy for a specific joint.
-
-#### Unload Controllers for a Joint
-Automatically deactivate all controllers claiming a specific joint, including their dependents:
-
-```cpp
-std::string joint_name = "shoulder_pan_joint";
-bool success = orchestrator->unloadControllersOfJoint(joint_name, timeout_s);
-```
-
-**⚠️ Warning**: This is a blocking call. Do not use in SingleThreadedExecutor callbacks.
-
-This function:
-1. Finds all active controllers that claim the specified joint
-2. Identifies any controllers that depend on those controllers (upstream dependents)
-3. Deactivates them in the correct topological order to avoid breaking dependencies
-
-This is particularly useful when you need to free up a joint for emergency stops, maintenance, or switching to a completely different control mode.
+`isControllerActive` and `areControllersActive` answer from the latest `~/activity` message, which
+the controller manager latches, so an orchestrator built after bring-up knows the states at once.
 
 ## Dependencies
 
 - `rclcpp`
+- `rcl_interfaces`
 - `controller_manager_msgs`
-- `lifecycle_msgs`

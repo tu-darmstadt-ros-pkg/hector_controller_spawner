@@ -1,1006 +1,588 @@
 #include <gtest/gtest.h>
 
-#include <controller_manager/controller_manager.hpp>
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <unistd.h>
+
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
-#include <hardware_interface/introspection.hpp>
-#include <hector_controller_spawner/hector_controller_spawner.hpp>
+#include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <hector_testing_utils/hector_testing_utils.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <realtime_tools/realtime_helpers.hpp>
 
-#include "controller_orchestrator_test_helpers.hpp"
 #include <controller_orchestrator/controller_orchestrator.hpp>
 
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <cmath>
-#include <cstring>
-#include <errno.h>
-#include <string>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
-
 using controller_manager_msgs::msg::ControllerManagerActivity;
+using controller_manager_msgs::msg::ControllerState;
 using controller_manager_msgs::srv::ListControllers;
-using controller_orchestrator_test::compute_expected_deactivation;
-using controller_orchestrator_test::load_file;
-using controller_orchestrator_test::spin_while_executing;
-using controller_orchestrator_test::states_from_activity;
-using controller_orchestrator_test::states_from_list;
+using controller_manager_msgs::srv::SwitchController;
 using hector_testing_utils::HectorTestFixture;
-
 using namespace std::chrono_literals;
 
 namespace
 {
+constexpr char kController[] = "arm_controller";
+constexpr char kOtherController[] = "gripper_controller";
 
-constexpr int kSchedPriority = 50;
+bool waitUntil( const std::function<bool()> &condition, std::chrono::milliseconds timeout )
+{
+  const auto end = std::chrono::steady_clock::now() + timeout;
+  while ( std::chrono::steady_clock::now() < end ) {
+    if ( condition() )
+      return true;
+    std::this_thread::sleep_for( 20ms );
+  }
+  return condition();
+}
 
+/// Every answer one async request got, in order.
+struct Answers {
+  std::mutex mutex;
+  std::vector<std::pair<bool, std::string>> received;
+
+  std::function<void( bool, const std::string & )> callback()
+  {
+    return [this]( bool success, const std::string &message ) {
+      std::lock_guard<std::mutex> lock( mutex );
+      received.emplace_back( success, message );
+    };
+  }
+  size_t count()
+  {
+    std::lock_guard<std::mutex> lock( mutex );
+    return received.size();
+  }
+  std::pair<bool, std::string> first()
+  {
+    std::lock_guard<std::mutex> lock( mutex );
+    return received.front();
+  }
+};
 } // namespace
 
 /**
- * This tests fixture sets up a ControllerManager with a spawner node and a ControllerOrchestrator.
- * The tests are executed four times with different configurations:
- * - Different Controller Configurations:
- *   - Normal: Basic controllers with chains of max length 2
- *   - MultipleChained: Controllers with multiple chains and longer dependencies
- * - Different Executor Types:
- *   - SingleThreadedExecutor: All nodes run in a single thread (some tests are skipped in this mode)
- *   - MultiThreadedExecutor: Nodes run in a multi-threaded executor
- * - each test is executed with all combinations of the above settings
+ * A stand-in controller manager. It records every switch request and answers with reply_, or not
+ * at all, lists listing_, and publishes ~/activity as the real one does. It declares the
+ * capabilities of hector_controller_manager unless a test says otherwise.
  */
-
-class ControllerOrchestratorFixtureBase : public HectorTestFixture
+class FakeControllerManagerTest : public HectorTestFixture
 {
 protected:
+  /// Whether switch_controller answers at all. One that does not is a manager that died.
+  virtual bool switchAnswers() const { return true; }
+  /// Whether the manager declares the capabilities parameter with force_auto.
+  virtual bool declaresForceAuto() const { return true; }
+
   void SetUp() override
   {
     HectorTestFixture::SetUp();
 
-    const auto config_files = get_config_files();
-    controllers_yaml_ = config_files.first;
-    spawner_yaml_ = config_files.second;
-    urdf_path_ = std::string( TEST_CONFIG_DIR ) + "/athena.urdf";
+    // Named as the manager, so its parameter services are where the orchestrator asks
+    fake_cm_node_ = std::make_shared<rclcpp::Node>( "fake_cm" );
+    if ( declaresForceAuto() )
+      fake_cm_node_->declare_parameter( "capabilities", std::vector<std::string>{ "force_auto" } );
+    list_service_ = fake_cm_node_->create_service<ListControllers>(
+        "/fake_cm/list_controllers", [this]( const ListControllers::Request::SharedPtr,
+                                             ListControllers::Response::SharedPtr response ) {
+          std::lock_guard<std::mutex> lock( mutex_ );
+          ++listings_;
+          response->controller = listing_;
+        } );
+    // The deferred form, so a request can go unanswered without blocking an executor thread
+    switch_service_ = fake_cm_node_->create_service<SwitchController>(
+        "/fake_cm/switch_controller",
+        [this]( const std::shared_ptr<rclcpp::Service<SwitchController>> service,
+                const std::shared_ptr<rmw_request_id_t> header,
+                const SwitchController::Request::SharedPtr request ) {
+          SwitchController::Response response;
+          {
+            std::lock_guard<std::mutex> lock( mutex_ );
+            requests_.push_back( *request );
+            response = reply_;
+          }
+          if ( switchAnswers() )
+            service->send_response( *header, response );
+        } );
+    activity_publisher_ = fake_cm_node_->create_publisher<ControllerManagerActivity>(
+        "/fake_cm/activity", rclcpp::QoS( 1 ).reliable().transient_local() );
+    reply_.ok = true;
 
-    const std::string urdf = load_file( urdf_path_ );
-    ASSERT_FALSE( urdf.empty() );
+    // Its own executor, so the orchestrator's responses are delivered by the fixture's executor
+    fake_cm_executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
+    fake_cm_executor_->add_node( fake_cm_node_ );
+    fake_cm_thread_ = std::thread( [this]() { fake_cm_executor_->spin(); } );
 
-    auto yaml_options = hector_testing_utils::node_options_from_yaml( controllers_yaml_ );
-    auto cm_options = controller_manager::get_cm_node_options();
-    cm_options.arguments( yaml_options.arguments() );
-    cm_options.automatically_declare_parameters_from_overrides( true );
-
-    // Initialize pal_statistics registries before ControllerManager registers interfaces.
-    INITIALIZE_ROS2_CONTROL_INTROSPECTION_REGISTRY( tester_node_,
-                                                    hardware_interface::DEFAULT_INTROSPECTION_TOPIC,
-                                                    hardware_interface::DEFAULT_REGISTRY_KEY );
-    INITIALIZE_ROS2_CONTROL_INTROSPECTION_REGISTRY( tester_node_,
-                                                    hardware_interface::CM_STATISTICS_TOPIC,
-                                                    hardware_interface::CM_STATISTICS_KEY );
-
-    cm_executor_ = create_cm_executor();
-    ASSERT_NE( cm_executor_, nullptr );
-    controller_manager_ = std::make_shared<controller_manager::ControllerManager>(
-        cm_executor_, urdf, false, "controller_manager", "", cm_options );
-
-    cm_executor_->add_node( controller_manager_ );
-
-    const bool use_sim_time = controller_manager_->get_parameter_or( "use_sim_time", false );
-    const bool has_realtime = realtime_tools::has_realtime_kernel();
-    const bool lock_memory =
-        controller_manager_->get_parameter_or<bool>( "lock_memory", has_realtime );
-    if ( lock_memory ) {
-      const auto lock_result = realtime_tools::lock_memory();
-      if ( !lock_result.first ) {
-        RCLCPP_WARN( controller_manager_->get_logger(), "Unable to lock the memory: '%s'",
-                     lock_result.second.c_str() );
-      }
-    }
-
-    RCLCPP_INFO( controller_manager_->get_logger(), "update rate is %d Hz",
-                 controller_manager_->get_update_rate() );
-    const bool manage_overruns =
-        controller_manager_->get_parameter_or<bool>( "overruns.manage", true );
-    RCLCPP_INFO( controller_manager_->get_logger(), "Overruns handling is : %s",
-                 manage_overruns ? "enabled" : "disabled" );
-    const int thread_priority =
-        controller_manager_->get_parameter_or<int>( "thread_priority", kSchedPriority );
-    RCLCPP_INFO( controller_manager_->get_logger(),
-                 "Spawning %s RT thread with scheduler priority: %d",
-                 controller_manager_->get_name(), thread_priority );
-
-    cm_running_ = true;
-    cm_spin_thread_ = std::thread( [this]() { cm_executor_->spin(); } );
-
-    start_update_loop( use_sim_time, manage_overruns, thread_priority );
-
-    activity_sub_ = tester_node_->create_test_subscription<ControllerManagerActivity>(
-        "/controller_manager/activity" );
-    list_client_ =
-        tester_node_->create_test_client<ListControllers>( "/controller_manager/list_controllers" );
-
-    ASSERT_TRUE( list_client_->wait_for_service( *executor_, 10s ) );
-
-    orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>(
-        tester_node_, "/controller_manager" );
-
-    ASSERT_TRUE( start_spawner_node() );
-
-    // wait until the multi-spawner has loaded and started the controllers
-    // if this fails, likely the spawner node failed to not the orchestrator
-    ASSERT_TRUE( wait_for_activity( expected_initial_states(), 30s ) );
+    orchestrator_ = std::make_shared<controller_orchestrator::ControllerOrchestrator>( tester_node_,
+                                                                                       "/fake_cm" );
   }
 
   void TearDown() override
   {
-    // 1. Stop the application specific logic
-    stop_spawner_node();
-
-    // 2. DESTROY THE ORCHESTRATOR NOW.
-    // If this waits until the class destructor (after rclcpp::shutdown),
-    // it triggers the double free.
     orchestrator_.reset();
-
-    // 3. Reset test clients/subs explicitly
-    activity_sub_.reset();
-    list_client_.reset();
-
-    // 4. Stop Controller Manager (joins threads, resets CM)
-    // This ensures plugins are unloaded while the context is still valid.
-    stop_controller_manager();
-
-    // 5. Reset Base Class Resources
-    // Even though these are in the base class, we must kill them before
-    // calling the base TearDown which shuts down ROS.
-    if ( tester_node_ )
-      tester_node_.reset();
-
-    if ( executor_ ) {
-      // Ensure the internal thread of TestExecutor is stopped
-      executor_.reset();
-    }
-
-    // 6. NOW it is safe to shut down the global context
+    fake_cm_executor_->cancel();
+    if ( fake_cm_thread_.joinable() )
+      fake_cm_thread_.join();
+    switch_service_.reset();
+    list_service_.reset();
+    activity_publisher_.reset();
+    fake_cm_node_.reset();
+    fake_cm_executor_.reset();
     HectorTestFixture::TearDown();
-
-    // sleep for 0.3
-    std::this_thread::sleep_for( 300ms );
   }
 
-  virtual std::unordered_map<std::string, std::string> expected_initial_states() const
+  /// The orchestrator refuses outright while its client has not discovered the service, which
+  /// would pass a test for the wrong reason.
+  void waitForService()
   {
-    const std::string config_name = get_config_name();
-    if ( config_name == "Normal" ) {
-      return {
-          { "joint_state_broadcaster", "active" },
-          { "flipper_velocity_controller", "active" },
-          { "vel_to_pos_controller", "active" },
-          { "gripper_trajectory_controller", "active" },
-          { "arm_trajectory_controller", "active" },
-          { "flipper_trajectory_controller", "inactive" },
-      };
-    }
-    // case MultipleChained
-    return {
-        { "joint_state_broadcaster", "active" },
-        { "flipper_velocity_controller", "active" },
-        { "vel_to_pos_controller", "active" },
-        { "gripper_trajectory_controller", "active" },
-        { "arm_trajectory_controller", "active" },
-        { "flipper_trajectory_controller", "inactive" },
-        { "arm_safety_position_controller", "active" },
-        { "flipper_safety_position_controller", "active" },
-    };
+    auto client =
+        tester_node_->create_test_client<SwitchController>( "/fake_cm/switch_controller" );
+    ASSERT_TRUE( client->wait_for_service( *executor_, 10s ) );
   }
 
-  virtual std::string get_config_name() const = 0;
-
-  bool wait_for_activity( const std::unordered_map<std::string, std::string> &expected,
-                          std::chrono::nanoseconds timeout )
+  void publishActivity( const std::vector<std::pair<std::string, uint8_t>> &controllers )
   {
-    return activity_sub_->wait_for_message(
-        *executor_, timeout, [&expected]( const ControllerManagerActivity &msg ) {
-          const auto states = states_from_activity( msg );
-          for ( const auto &pair : expected ) {
-            auto it = states.find( pair.first );
-            if ( it == states.end() || it->second != pair.second ) {
-              return false;
-            }
-          }
-          return true;
-        } );
+    ControllerManagerActivity message;
+    for ( const auto &[name, id] : controllers ) {
+      controller_manager_msgs::msg::NamedLifecycleState state;
+      state.name = name;
+      state.state.id = id;
+      message.controllers.push_back( state );
+    }
+    activity_publisher_->publish( message );
   }
 
-  ListControllers::Response::SharedPtr list_controllers()
+  std::vector<SwitchController::Request> requests()
   {
-    auto request = std::make_shared<ListControllers::Request>();
-    hector_testing_utils::ServiceCallOptions options;
-    options.service_timeout = 10s;
-    options.response_timeout = 10s;
-    return hector_testing_utils::call_service<ListControllers>( list_client_->get(), request,
-                                                                *executor_, options );
+    std::lock_guard<std::mutex> lock( mutex_ );
+    return requests_;
   }
 
-  bool wait_for_list_states( const std::unordered_map<std::string, std::string> &expected,
-                             std::chrono::nanoseconds timeout )
+  void reply( bool ok, const std::string &message )
   {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while ( std::chrono::steady_clock::now() < deadline ) {
-      const auto resp = list_controllers();
-      if ( resp != nullptr ) {
-        const auto states = states_from_list( *resp );
-        bool matches = true;
-        for ( const auto &pair : expected ) {
-          auto it = states.find( pair.first );
-          if ( it == states.end() || it->second != pair.second ) {
-            matches = false;
-            break;
-          }
-        }
-        if ( matches ) {
-          return true;
-        }
-      }
-      executor_->spin_some();
-      std::this_thread::sleep_for( 50ms );
-    }
-    // print final states for debugging
-    const auto resp = list_controllers();
-    if ( resp != nullptr ) {
-      const auto states = states_from_list( *resp );
-      RCLCPP_INFO( tester_node_->get_logger(), "Final controller states:" );
-      for ( const auto &pair : states ) {
-        RCLCPP_INFO( tester_node_->get_logger(), "  %s: %s", pair.first.c_str(), pair.second.c_str() );
-      }
-    }
-    return false;
+    std::lock_guard<std::mutex> lock( mutex_ );
+    reply_.ok = ok;
+    reply_.message = message;
   }
 
-  int get_number_of_active_controllers()
+  void list( std::vector<ControllerState> controllers )
   {
-    const auto resp = list_controllers();
-    if ( resp == nullptr ) {
-      return 0;
-    }
-    int count = 0;
-    for ( const auto &ctrl : resp->controller ) {
-      if ( ctrl.state == "active" ) {
-        ++count;
-      }
-    }
-    return count;
+    std::lock_guard<std::mutex> lock( mutex_ );
+    listing_ = std::move( controllers );
   }
 
-  void start_update_loop( bool use_sim_time, bool manage_overruns, int thread_priority )
+  int listings()
   {
-    cm_update_thread_ = std::thread( [this, use_sim_time, manage_overruns, thread_priority]() {
-      rclcpp::Parameter cpu_affinity_param;
-      if ( controller_manager_->get_parameter( "cpu_affinity", cpu_affinity_param ) ) {
-        std::vector<int> cpus;
-        if ( cpu_affinity_param.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER ) {
-          cpus = { static_cast<int>( cpu_affinity_param.as_int() ) };
-        } else if ( cpu_affinity_param.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER_ARRAY ) {
-          const auto cpu_affinity_param_array = cpu_affinity_param.as_integer_array();
-          for ( const auto cpu : cpu_affinity_param_array ) {
-            cpus.push_back( static_cast<int>( cpu ) );
-          }
-        }
-        const auto affinity_result = realtime_tools::set_current_thread_affinity( cpus );
-        if ( !affinity_result.first ) {
-          RCLCPP_WARN( controller_manager_->get_logger(), "Unable to set the CPU affinity : '%s'",
-                       affinity_result.second.c_str() );
-        }
-      }
-
-      if ( !realtime_tools::configure_sched_fifo( thread_priority ) ) {
-        RCLCPP_WARN(
-            controller_manager_->get_logger(),
-            "Could not enable FIFO RT scheduling policy: with error number <%i>(%s). See "
-            "[https://control.ros.org/master/doc/ros2_control/controller_manager/doc/userdoc.html] "
-            "for details on how to enable realtime scheduling.",
-            errno, std::strerror( errno ) );
-      } else {
-        RCLCPP_INFO( controller_manager_->get_logger(),
-                     "Successful set up FIFO RT scheduling policy with priority %i.",
-                     thread_priority );
-      }
-
-      controller_manager_->get_clock()->wait_until_started();
-      controller_manager_->get_clock()->sleep_for(
-          rclcpp::Duration::from_seconds( 1.0 / controller_manager_->get_update_rate() ) );
-
-      const auto period =
-          std::chrono::nanoseconds( 1'000'000'000 / controller_manager_->get_update_rate() );
-      rclcpp::Time previous_time = controller_manager_->get_trigger_clock()->now();
-      std::this_thread::sleep_for( period );
-
-      std::chrono::steady_clock::time_point next_iteration_time{ std::chrono::steady_clock::now() };
-
-      while ( cm_running_ && rclcpp::ok() ) {
-        const auto current_time = controller_manager_->get_trigger_clock()->now();
-        const auto measured_period = current_time - previous_time;
-        previous_time = current_time;
-
-        controller_manager_->read( current_time, measured_period );
-        controller_manager_->update( current_time, measured_period );
-        controller_manager_->write( current_time, measured_period );
-
-        if ( use_sim_time ) {
-          controller_manager_->get_clock()->sleep_until( current_time + period );
-        } else {
-          next_iteration_time += period;
-          const auto time_now = std::chrono::steady_clock::now();
-          if ( manage_overruns && next_iteration_time < time_now ) {
-            const double time_diff =
-                static_cast<double>( std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         time_now - next_iteration_time )
-                                         .count() ) /
-                1.e6;
-            const double cm_period =
-                1.e3 / static_cast<double>( controller_manager_->get_update_rate() );
-            const int overrun_count = static_cast<int>( std::ceil( time_diff / cm_period ) );
-            RCLCPP_WARN_THROTTLE(
-                controller_manager_->get_logger(), *controller_manager_->get_clock(), 1000,
-                "Overrun detected! The controller manager missed its desired rate of %d Hz. The "
-                "loop took %f ms (missed cycles : %d).",
-                controller_manager_->get_update_rate(), time_diff + cm_period, overrun_count + 1 );
-            next_iteration_time += ( overrun_count * period );
-          }
-          std::this_thread::sleep_until( next_iteration_time );
-        }
-      }
-    } );
+    std::lock_guard<std::mutex> lock( mutex_ );
+    return listings_;
   }
 
-  bool start_spawner_node()
-  {
-    auto spawner_options = hector_testing_utils::node_options_from_yaml( spawner_yaml_ );
-    spawner_options.automatically_declare_parameters_from_overrides( false );
-    spawner_options.append_parameter_override( "controller_param_files",
-                                               std::vector<std::string>{ controllers_yaml_ } );
-    spawner_node_ = std::make_shared<hector_controller_spawner::MultiSpawner>( spawner_options );
-    spawner_node_->initialize();
-    spawner_node_->start_sequence( true );
-    executor_->add_node( spawner_node_ );
-    return true;
-  }
-
-  void stop_spawner_node()
-  {
-    if ( !spawner_node_ ) {
-      return;
-    }
-    spawner_node_.reset();
-  }
-
-  void stop_controller_manager()
-  {
-    cm_running_ = false;
-    if ( cm_update_thread_.joinable() ) {
-      cm_update_thread_.join();
-    }
-    if ( cm_executor_ ) {
-      cm_executor_->cancel();
-    }
-    if ( cm_spin_thread_.joinable() ) {
-      cm_spin_thread_.join();
-    }
-    controller_manager_.reset();
-    cm_executor_.reset();
-  }
-
-  std::string controllers_yaml_;
-  std::string spawner_yaml_;
-  std::string urdf_path_;
-
-  std::atomic<bool> cm_running_{ false };
-  std::shared_ptr<rclcpp::Executor> cm_executor_;
-  std::shared_ptr<controller_manager::ControllerManager> controller_manager_;
-  std::thread cm_spin_thread_;
-  std::thread cm_update_thread_;
-
+  std::shared_ptr<rclcpp::Node> fake_cm_node_;
+  rclcpp::Service<SwitchController>::SharedPtr switch_service_;
+  rclcpp::Service<ListControllers>::SharedPtr list_service_;
+  rclcpp::Publisher<ControllerManagerActivity>::SharedPtr activity_publisher_;
+  std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> fake_cm_executor_;
+  std::thread fake_cm_thread_;
   std::shared_ptr<controller_orchestrator::ControllerOrchestrator> orchestrator_;
-  std::shared_ptr<hector_controller_spawner::MultiSpawner> spawner_node_;
-  std::shared_ptr<hector_testing_utils::TestSubscription<ControllerManagerActivity>> activity_sub_;
-  std::shared_ptr<hector_testing_utils::TestClient<ListControllers>> list_client_;
-
-  virtual std::shared_ptr<rclcpp::Executor> create_cm_executor() = 0;
-  virtual std::pair<std::string, std::string> get_config_files() const = 0;
+  std::mutex mutex_;
+  std::vector<SwitchController::Request> requests_;
+  SwitchController::Response reply_;
+  std::vector<ControllerState> listing_;
+  int listings_{ 0 };
 };
 
-// Configuration traits for normal config
-struct NormalConfig {
-  static std::pair<std::string, std::string> get_config_files()
-  {
-    return { std::string( TEST_CONFIG_DIR ) + "/controllers.yaml",
-             std::string( TEST_CONFIG_DIR ) + "/controller_spawner.yaml" };
-  }
-  static const char *name() { return "Normal"; }
-};
-
-// Configuration traits for multiple chained config
-struct MultipleChainedConfig {
-  static std::pair<std::string, std::string> get_config_files()
-  {
-    return { std::string( TEST_CONFIG_DIR ) + "/controllers_multiple_chained.yaml",
-             std::string( TEST_CONFIG_DIR ) + "/controller_spawner_multiple_chained.yaml" };
-  }
-  static const char *name() { return "MultipleChained"; }
-};
-
-// Base template fixture combining executor type and config type
-template<typename ExecutorType, typename ConfigType>
-class ControllerOrchestratorFixtureTemplate : public ControllerOrchestratorFixtureBase
+/// Never answers switch_controller, as when the manager dies with a request in flight.
+class StalledSwitchTest : public FakeControllerManagerTest
 {
 protected:
-  std::shared_ptr<rclcpp::Executor> create_cm_executor() override
-  {
-    return ExecutorType::create_executor();
-  }
-
-  std::pair<std::string, std::string> get_config_files() const override
-  {
-    return ConfigType::get_config_files();
-  }
-
-  std::string get_config_name() const override { return ConfigType::name(); }
+  bool switchAnswers() const override { return false; }
 };
 
-// Executor type traits
-struct MultiThreadedExecutorType {
-  static std::shared_ptr<rclcpp::Executor> create_executor()
-  {
-    return std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
-  }
-  static const char *name() { return "MultiThreaded"; }
-};
-
-struct SingleThreadedExecutorType {
-  static std::shared_ptr<rclcpp::Executor> create_executor()
-  {
-    return std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
-  }
-  static const char *name() { return "SingleThreaded"; }
-};
-
-// ---------------------------------------------------------------------------
-// Test parameter combinations (Executor × Config)
-// ---------------------------------------------------------------------------
-struct NormalMultiThreaded {
-  using ExecutorType = MultiThreadedExecutorType;
-  using ConfigType = NormalConfig;
-};
-
-struct NormalSingleThreaded {
-  using ExecutorType = SingleThreadedExecutorType;
-  using ConfigType = NormalConfig;
-};
-
-struct MultipleChainedMultiThreaded {
-  using ExecutorType = MultiThreadedExecutorType;
-  using ConfigType = MultipleChainedConfig;
-};
-
-struct MultipleChainedSingleThreaded {
-  using ExecutorType = SingleThreadedExecutorType;
-  using ConfigType = MultipleChainedConfig;
-};
-
-// Typed fixture that wires executor/config combos into the common base
-template<typename Param>
-class ControllerOrchestratorTypedFixture
-    : public ControllerOrchestratorFixtureTemplate<typename Param::ExecutorType, typename Param::ConfigType>
+/// Declares no capabilities, as the stock ros2_control controller manager.
+class StockControllerManagerTest : public FakeControllerManagerTest
 {
 protected:
-  using Base =
-      ControllerOrchestratorFixtureTemplate<typename Param::ExecutorType, typename Param::ConfigType>;
-  using Base::activity_sub_;
-  using Base::controller_manager_;
-  using Base::executor_;
-  using Base::get_number_of_active_controllers;
-  using Base::list_controllers;
-  using Base::orchestrator_;
-  using Base::spawner_node_;
-  using Base::wait_for_activity;
-  using Base::wait_for_list_states;
+  bool declaresForceAuto() const override { return false; }
 };
 
-// Pretty type names for gtest
-struct ControllerOrchestratorTestName {
-  template<typename T>
-  static std::string GetName( int )
-  {
-    return std::string( T::ConfigType::name() ) + "_" + T::ExecutorType::name();
-  }
-};
-
-using ControllerOrchestratorTestTypes =
-    ::testing::Types<NormalMultiThreaded, NormalSingleThreaded, MultipleChainedMultiThreaded,
-                     MultipleChainedSingleThreaded>;
-
-TYPED_TEST_SUITE( ControllerOrchestratorTypedFixture, ControllerOrchestratorTestTypes,
-                  ControllerOrchestratorTestName );
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSync )
+ControllerState controller( const std::string &name, const std::string &state,
+                            std::vector<std::string> command_interfaces,
+                            std::vector<std::string> reference_interfaces = {} )
 {
-  const std::vector<std::string> requested = { "flipper_trajectory_controller" };
-  const auto before_resp = this->list_controllers();
-  ASSERT_NE( before_resp, nullptr );
-
-  const auto expected_deactivate = compute_expected_deactivation( *before_resp, requested );
-
-  this->activity_sub_->reset();
-  std::atomic<bool> switch_done{ false };
-  bool switch_success = false;
-  std::thread switch_thread( [this, &requested, &switch_done, &switch_success]() {
-    auto to_activate = requested;
-    switch_success = this->orchestrator_->smartSwitchController( to_activate, 10 );
-    switch_done = true;
-  } );
-  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
-  ASSERT_TRUE( this->executor_->spin_until( [&switch_done]() { return switch_done.load(); }, 20s ) );
-  switch_thread.join();
-  ASSERT_TRUE( switch_success );
-
-  const auto after_resp = this->list_controllers();
-  ASSERT_NE( after_resp, nullptr );
-
-  const auto before_states = states_from_list( *before_resp );
-  const auto after_states = states_from_list( *after_resp );
-
-  EXPECT_EQ( after_states.at( "flipper_trajectory_controller" ), "active" );
-
-  for ( const auto &name : expected_deactivate ) {
-    auto it = after_states.find( name );
-    if ( it != after_states.end() ) {
-      EXPECT_NE( it->second, "active" );
-    }
-  }
-
-  for ( const auto &pair : before_states ) {
-    if ( pair.second == "active" && expected_deactivate.count( pair.first ) == 0U &&
-         std::find( requested.begin(), requested.end(), pair.first ) == requested.end() ) {
-      EXPECT_EQ( after_states.at( pair.first ), "active" );
-    }
-  }
+  ControllerState controller;
+  controller.name = name;
+  controller.state = state;
+  controller.required_command_interfaces = std::move( command_interfaces );
+  controller.reference_interfaces = std::move( reference_interfaces );
+  controller.is_chainable = !controller.reference_interfaces.empty();
+  return controller;
 }
 
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsyncSingleThreadedExecutor )
+constexpr uint8_t kActive = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+constexpr uint8_t kInactive = lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
+
+// The controller manager resolves providers and conflicts, so a switch is exactly one request
+TEST_F( FakeControllerManagerTest, ASwitchIsOneForceAutoRequest )
 {
-  const std::vector<std::string> requested = { "flipper_trajectory_controller" };
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
 
-  this->activity_sub_->reset();
-  std::atomic<bool> callback_done{ false };
-  bool async_success = false;
-  std::string async_message;
+  EXPECT_TRUE( orchestrator_->smartSwitchController( { kController, kOtherController }, 3 ) );
 
-  // hack for single threaded executor using async function
-  std::thread async_thread( [this, &requested, &callback_done, &async_success, &async_message]() {
-    this->orchestrator_->smartSwitchControllerAsync(
-        requested,
-        [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
-          async_success = success;
-          async_message = message;
-          callback_done = true;
-        } );
-  } );
-
-  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
-  ASSERT_TRUE(
-      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
-  async_thread.join();
-  ASSERT_TRUE( async_success ) << async_message;
+  const auto sent = requests();
+  ASSERT_EQ( sent.size(), 1u );
+  EXPECT_EQ( sent[0].activate_controllers,
+             ( std::vector<std::string>{ kController, kOtherController } ) );
+  EXPECT_TRUE( sent[0].deactivate_controllers.empty() );
+  EXPECT_EQ( sent[0].strictness, SwitchController::Request::FORCE_AUTO );
+  // What is left of the timeout after reading the capabilities
+  EXPECT_LE( rclcpp::Duration( sent[0].timeout ), rclcpp::Duration( 3s ) );
+  EXPECT_GT( rclcpp::Duration( sent[0].timeout ), rclcpp::Duration( 2500ms ) );
+  EXPECT_EQ( listings(), 0 );
 }
 
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAsync )
+TEST_F( FakeControllerManagerTest, AnAsyncSwitchIsOneForceAutoRequestAnsweredOnce )
 {
-  const std::vector<std::string> requested = { "flipper_trajectory_controller" };
-  this->activity_sub_->reset();
-  const auto before_resp = this->list_controllers();
-  ASSERT_NE( before_resp, nullptr );
-  const auto expected_deactivate = compute_expected_deactivation( *before_resp, requested );
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
 
-  std::atomic<bool> callback_done{ false };
-  bool async_success = false;
-  std::string async_message;
+  Answers answers;
+  orchestrator_->smartSwitchControllerAsync( { kController }, answers.callback(), 2 );
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_TRUE( answers.first().first ) << answers.first().second;
 
-  this->activity_sub_->reset();
-  this->orchestrator_->smartSwitchControllerAsync(
-      requested,
-      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
-        async_success = success;
-        async_message = message;
-        callback_done = true;
+  const auto sent = requests();
+  ASSERT_EQ( sent.size(), 1u );
+  EXPECT_EQ( sent[0].activate_controllers, std::vector<std::string>{ kController } );
+  EXPECT_EQ( sent[0].strictness, SwitchController::Request::FORCE_AUTO );
+  EXPECT_LE( rclcpp::Duration( sent[0].timeout ), rclcpp::Duration( 2s ) );
+  EXPECT_GT( rclcpp::Duration( sent[0].timeout ), rclcpp::Duration( 1500ms ) );
+
+  // Past the deadline, which must not answer a second time
+  std::this_thread::sleep_for( 3500ms );
+  EXPECT_EQ( answers.count(), 1u );
+}
+
+TEST_F( FakeControllerManagerTest, ARefusedSwitchFailsWithTheManagersReason )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+  reply( false, "arm_torque_off_controller is protected" );
+
+  EXPECT_FALSE( orchestrator_->smartSwitchController( { kController }, 3 ) );
+
+  Answers answers;
+  orchestrator_->smartSwitchControllerAsync( { kController }, answers.callback(), 3 );
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_FALSE( answers.first().first );
+  EXPECT_EQ( answers.first().second, "arm_torque_off_controller is protected" );
+  EXPECT_EQ( requests().size(), 2u );
+}
+
+TEST_F( FakeControllerManagerTest, AnEmptySwitchSendsNothing )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+
+  EXPECT_TRUE( orchestrator_->smartSwitchController( {}, 3 ) );
+  Answers answers;
+  orchestrator_->smartSwitchControllerAsync( {}, answers.callback(), 3 );
+  ASSERT_EQ( answers.count(), 1u );
+  EXPECT_TRUE( answers.first().first );
+  std::this_thread::sleep_for( 200ms );
+  EXPECT_TRUE( requests().empty() );
+}
+
+TEST_F( StalledSwitchTest, AnUnansweredSwitchFailsAtItsDeadline )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+
+  Answers answers;
+  orchestrator_->smartSwitchControllerAsync( { kController }, answers.callback(), 1 );
+
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) )
+      << "the request was never answered although the controller manager did not answer";
+  EXPECT_FALSE( answers.first().first );
+  EXPECT_EQ( requests().size(), 1u );
+
+  std::this_thread::sleep_for( 2500ms );
+  EXPECT_EQ( answers.count(), 1u );
+}
+
+TEST_F( StalledSwitchTest, ABlockingSwitchGivesUpAfterItsTimeout )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE( orchestrator_->smartSwitchController( { kController }, 1 ) );
+  // The timeout of 1 s plus the 2 s answer margin, with 1 s to spare
+  EXPECT_LT( std::chrono::steady_clock::now() - start, 4s );
+}
+
+TEST_F( StalledSwitchTest, DestructionWaitsForACallbackInProgress )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+
+  std::atomic<bool> entered{ false };
+  std::atomic<bool> finished{ false };
+  orchestrator_->smartSwitchControllerAsync(
+      { kController },
+      [&]( bool, const std::string & ) {
+        entered = true;
+        std::this_thread::sleep_for( 500ms );
+        finished = true;
+      },
+      1 );
+  ASSERT_TRUE( waitUntil( [&] { return entered.load(); }, 5000ms ) );
+
+  orchestrator_.reset();
+  EXPECT_TRUE( finished.load() ) << "the orchestrator was destroyed while its callback still ran";
+}
+
+TEST_F( StalledSwitchTest, AnOrchestratorCanBeDestroyedFromItsOwnCallback )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+
+  std::atomic<bool> destroyed{ false };
+  orchestrator_->smartSwitchControllerAsync(
+      { kController },
+      [&]( bool, const std::string & ) {
+        orchestrator_.reset();
+        destroyed = true;
+      },
+      1 );
+  EXPECT_TRUE( waitUntil( [&] { return destroyed.load(); }, 5000ms ) )
+      << "destroying the orchestrator from its own callback did not return";
+}
+
+// Without a controller manager the callback still runs, once, with the reason
+TEST_F( FakeControllerManagerTest, AnAsyncSwitchWithoutAControllerManagerFailsOnce )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  controller_orchestrator::ControllerOrchestrator orphan( tester_node_, "/no_cm" );
+
+  Answers answers;
+  orphan.smartSwitchControllerAsync( { kController }, answers.callback(), 1 );
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_FALSE( answers.first().first );
+  EXPECT_NE( answers.first().second.find( "not available" ), std::string::npos )
+      << answers.first().second;
+
+  // Past the deadline, which must not answer a second time
+  std::this_thread::sleep_for( 2500ms );
+  EXPECT_EQ( answers.count(), 1u );
+}
+
+// A switch requested right after start-up waits for the service within its own timeout
+TEST_F( FakeControllerManagerTest, AnAsyncSwitchWaitsForALateControllerManager )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  // Unique, so a service of an earlier run still in the discovery cache cannot answer for it
+  const std::string manager = "/late_cm_" + std::to_string( getpid() );
+  controller_orchestrator::ControllerOrchestrator orchestrator( tester_node_, manager );
+
+  Answers answers;
+  orchestrator.smartSwitchControllerAsync( { kController }, answers.callback(), 3 );
+  std::this_thread::sleep_for( 500ms );
+  std::atomic<int> requests{ 0 };
+  std::atomic<int64_t> request_timeout_ns{ 0 };
+  const auto late_node = std::make_shared<rclcpp::Node>( manager.substr( 1 ) );
+  late_node->declare_parameter( "capabilities", std::vector<std::string>{ "force_auto" } );
+  const auto late_list = late_node->create_service<ListControllers>(
+      "~/list_controllers",
+      []( const ListControllers::Request::SharedPtr, ListControllers::Response::SharedPtr ) { } );
+  const auto late_service = late_node->create_service<SwitchController>(
+      "~/switch_controller", [&]( const SwitchController::Request::SharedPtr request,
+                                  SwitchController::Response::SharedPtr response ) {
+        request_timeout_ns = rclcpp::Duration( request->timeout ).nanoseconds();
+        requests++;
+        response->ok = true;
       } );
+  fake_cm_executor_->add_node( late_node );
 
-  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" } }, 20s ) );
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_TRUE( answers.first().first ) << answers.first().second;
+  EXPECT_EQ( requests.load(), 1 );
+  EXPECT_LT( request_timeout_ns.load(), rclcpp::Duration( 2500ms ).nanoseconds() )
+      << "the wait is part of the timeout";
+  EXPECT_GT( request_timeout_ns.load(), 0 );
+  fake_cm_executor_->remove_node( late_node );
+}
+
+TEST_F( FakeControllerManagerTest, AnOrchestratorNotOwnedByASharedPtrAnswers )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+  controller_orchestrator::ControllerOrchestrator orchestrator( tester_node_, "/fake_cm" );
+  // Blocking first, because it waits for its client to discover the service
+  ASSERT_TRUE( orchestrator.smartSwitchController( { kController }, 3 ) );
+
+  Answers answers;
+  orchestrator.smartSwitchControllerAsync( { kController }, answers.callback() );
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_TRUE( answers.first().first ) << answers.first().second;
+}
+
+TEST_F( FakeControllerManagerTest, ANodeOwningItsOrchestratorIsReleased )
+{
+  struct OwningNode : rclcpp::Node {
+    OwningNode() : rclcpp::Node( "orchestrator_owner" ) { }
+    std::shared_ptr<controller_orchestrator::ControllerOrchestrator> orchestrator;
+  };
+  auto owner = std::make_shared<OwningNode>();
+  owner->orchestrator =
+      std::make_shared<controller_orchestrator::ControllerOrchestrator>( owner, "/fake_cm" );
+  const std::weak_ptr<OwningNode> weak_owner = owner;
+
+  owner.reset();
+  EXPECT_TRUE( weak_owner.expired() ) << "the orchestrator keeps the node that owns it alive";
+}
+
+TEST_F( FakeControllerManagerTest, ControllersAreActiveAsTheLatestActivitySays )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+
+  publishActivity( { { kController, kActive }, { kOtherController, kInactive } } );
+  ASSERT_TRUE( waitUntil( [&] { return orchestrator_->isControllerActive( kController ); }, 5000ms ) );
+  EXPECT_TRUE( orchestrator_->areControllersActive( { kController } ) );
+  EXPECT_FALSE( orchestrator_->areControllersActive( { kController, kOtherController } ) );
+  EXPECT_FALSE( orchestrator_->areControllersActive( { "unknown_controller" } ) );
+
+  publishActivity( { { kController, kInactive }, { kOtherController, kActive } } );
   ASSERT_TRUE(
-      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
-  ASSERT_TRUE( async_success ) << async_message;
-
-  const auto after_resp = this->list_controllers();
-  ASSERT_NE( after_resp, nullptr );
-
-  const auto before_states = states_from_list( *before_resp );
-  const auto after_states = states_from_list( *after_resp );
-
-  EXPECT_EQ( after_states.at( "flipper_trajectory_controller" ), "active" );
-
-  for ( const auto &name : expected_deactivate ) {
-    auto it = after_states.find( name );
-    if ( it != after_states.end() ) {
-      EXPECT_NE( it->second, "active" );
-    }
-  }
-
-  for ( const auto &pair : before_states ) {
-    if ( pair.second == "active" && expected_deactivate.count( pair.first ) == 0U &&
-         std::find( requested.begin(), requested.end(), pair.first ) == requested.end() ) {
-      EXPECT_EQ( after_states.at( pair.first ), "active" );
-    }
-  }
+      waitUntil( [&] { return orchestrator_->isControllerActive( kOtherController ); }, 5000ms ) );
+  EXPECT_FALSE( orchestrator_->areControllersActive( { kController } ) );
 }
 
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActive )
+// The manager latches its activity, so an orchestrator built later knows the states at once
+TEST_F( FakeControllerManagerTest, AnOrchestratorBuiltAfterTheActivityKnowsTheStates )
 {
-  // skip for single threaded executor to avoid deadlock with blocking sync call
-  if ( TypeParam::ExecutorType::name() == std::string( "SingleThreaded" ) ) {
-    GTEST_SKIP() << "Skipping sync test for single threaded executor to avoid deadlock.";
-  }
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  publishActivity( { { kController, kActive } } );
 
-  // Edge case: trying to activate a controller that is already active should be a no-op
-  const std::vector<std::string> requested = { "flipper_velocity_controller" };
-
-  const auto before_resp = this->list_controllers();
-  ASSERT_NE( before_resp, nullptr );
-  const auto before_states = states_from_list( *before_resp );
-
-  // Verify flipper_velocity_controller is already active
-  ASSERT_EQ( before_states.at( "flipper_velocity_controller" ), "active" );
-
-  this->activity_sub_->reset();
-  auto to_activate = requested;
-  const bool switch_success = this->orchestrator_->smartSwitchController( to_activate, 10 );
-  ASSERT_TRUE( switch_success );
-
-  const auto after_resp = this->list_controllers();
-  ASSERT_NE( after_resp, nullptr );
-  const auto after_states = states_from_list( *after_resp );
-
-  // Verify nothing changed - controller still active, all other states unchanged
-  EXPECT_EQ( after_states.at( "flipper_velocity_controller" ), "active" );
-  for ( const auto &pair : before_states ) {
-    EXPECT_EQ( after_states.at( pair.first ), pair.second );
-  }
+  controller_orchestrator::ControllerOrchestrator late( tester_node_, "/fake_cm" );
+  EXPECT_TRUE( waitUntil( [&] { return late.areControllersActive( { kController } ); }, 5000ms ) );
 }
 
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchAlreadyActiveAsync )
+// Stock ros2_control runs FORCE_AUTO as BEST_EFFORT, so the orchestrator plans the chain and the
+// conflicts itself and sends them as one STRICT request
+TEST_F( StockControllerManagerTest, AChainReplacesTheChainOnItsJointInOneStrictSwitch )
 {
-  // Edge case (async): trying to activate a controller that is already active should be a no-op
-  const std::vector<std::string> requested = { "flipper_velocity_controller" };
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+  list( { controller( "old_head", "active", { "old_safety/joint_1/position" } ),
+          controller( "old_safety", "active", { "joint_1/position" }, { "joint_1/position" } ),
+          controller( "arm_trajectory", "inactive", { "arm_safety/joint_1/position" } ),
+          controller( "arm_safety", "inactive", { "joint_1/position" }, { "joint_1/position" } ),
+          controller( "flipper", "active", { "joint_2/position" } ) } );
 
-  const auto before_resp = this->list_controllers();
-  ASSERT_NE( before_resp, nullptr );
-  const auto before_states = states_from_list( *before_resp );
+  EXPECT_TRUE( orchestrator_->smartSwitchController( { "arm_trajectory" }, 3 ) );
 
-  // Verify flipper_velocity_controller is already active
-  ASSERT_EQ( before_states.at( "flipper_velocity_controller" ), "active" );
+  const auto sent = requests();
+  ASSERT_EQ( sent.size(), 1u );
+  EXPECT_EQ( sent[0].strictness, SwitchController::Request::STRICT );
+  EXPECT_EQ( sent[0].activate_controllers,
+             ( std::vector<std::string>{ "arm_trajectory", "arm_safety" } ) );
+  EXPECT_EQ( sent[0].deactivate_controllers,
+             ( std::vector<std::string>{ "old_head", "old_safety" } ) );
+  EXPECT_GT( rclcpp::Duration( sent[0].timeout ), rclcpp::Duration( 2500ms ) );
+}
 
-  this->activity_sub_->reset();
-  std::atomic<bool> callback_done{ false };
-  bool async_success = false;
-  std::string async_message;
+// A conflict on a reference interface stops the other head, and what reads its state with it
+TEST_F( StockControllerManagerTest, AConflictOnAReferenceStopsTheOtherHeadAndItsPreceders )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+  auto head_a = controller( "head_a", "active", { "safety/joint_1/position" } );
+  head_a.exported_state_interfaces = { "joint_1/estimate" };
+  head_a.is_chainable = true;
+  auto watcher = controller( "watcher", "active", {} );
+  watcher.required_state_interfaces = { "head_a/joint_1/estimate" };
+  list( { controller( "safety", "active", { "joint_1/position" }, { "joint_1/position" } ), head_a,
+          watcher, controller( "head_b", "inactive", { "safety/joint_1/position" } ) } );
 
-  this->orchestrator_->smartSwitchControllerAsync(
-      requested,
-      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
-        async_success = success;
-        async_message = message;
-        callback_done = true;
-      } );
+  Answers answers;
+  orchestrator_->smartSwitchControllerAsync( { "head_b" }, answers.callback(), 3 );
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_TRUE( answers.first().first ) << answers.first().second;
 
+  const auto sent = requests();
+  ASSERT_EQ( sent.size(), 1u );
+  EXPECT_EQ( sent[0].strictness, SwitchController::Request::STRICT );
+  EXPECT_EQ( sent[0].activate_controllers, std::vector<std::string>{ "head_b" } );
+  EXPECT_EQ( sent[0].deactivate_controllers, ( std::vector<std::string>{ "head_a", "watcher" } ) );
+}
+
+TEST_F( StockControllerManagerTest, AFailedActivationIsAFailure )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+  list( { controller( kController, "inactive", { "joint_1/position" } ) } );
+  reply( false, "Could not activate controller : 'arm_controller'" );
+
+  Answers answers;
+  orchestrator_->smartSwitchControllerAsync( { kController }, answers.callback(), 3 );
+  ASSERT_TRUE( waitUntil( [&] { return answers.count() > 0; }, 5000ms ) );
+  EXPECT_FALSE( answers.first().first );
+  EXPECT_EQ( answers.first().second, "Could not activate controller : 'arm_controller'" );
+  EXPECT_FALSE( orchestrator_->smartSwitchController( { kController }, 3 ) );
+}
+
+// The stock manager drops such a controller from a switch and still answers ok
+TEST_F( StockControllerManagerTest, AControllerThatCannotBeActivatedFailsWithoutASwitch )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+  list( { controller( kController, "inactive", { "joint_1/position" } ),
+          controller( kOtherController, "unconfigured", {} ) } );
+
+  EXPECT_FALSE( orchestrator_->smartSwitchController( { kController, kOtherController }, 3 ) );
+  EXPECT_FALSE( orchestrator_->smartSwitchController( { "unknown_controller" }, 3 ) );
+  EXPECT_TRUE( requests().empty() );
+}
+
+TEST_F( StockControllerManagerTest, ActiveControllersNeedNoSwitch )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+  list( { controller( kController, "active", { "joint_1/position" } ) } );
+
+  EXPECT_TRUE( orchestrator_->smartSwitchController( { kController }, 3 ) );
+  EXPECT_TRUE( requests().empty() );
+}
+
+// A restarted manager may be another one, so its capabilities are read again
+TEST_F( FakeControllerManagerTest, ARestartedControllerManagerIsAskedAgain )
+{
+  hector_testing_utils::TestExecutor::ScopedSpinner spinner( *executor_ );
+  waitForService();
+  publishActivity( { { kController, kActive } } );
+  ASSERT_TRUE( waitUntil( [&] { return orchestrator_->isControllerActive( kController ); }, 5000ms ) );
+  ASSERT_TRUE( orchestrator_->smartSwitchController( { kController }, 3 ) );
+  ASSERT_EQ( requests().back().strictness, SwitchController::Request::FORCE_AUTO );
+
+  fake_cm_node_->set_parameter( rclcpp::Parameter( "capabilities", std::vector<std::string>{} ) );
+  list( { controller( kController, "inactive", { "joint_1/position" } ) } );
+  // Unchanged until the manager is seen to restart
+  ASSERT_TRUE( orchestrator_->smartSwitchController( { kController }, 3 ) );
+  ASSERT_EQ( requests().back().strictness, SwitchController::Request::FORCE_AUTO );
+
+  activity_publisher_ = fake_cm_node_->create_publisher<ControllerManagerActivity>(
+      "/fake_cm/activity", rclcpp::QoS( 1 ).reliable().transient_local() );
+  publishActivity( { { kController, kInactive } } );
   ASSERT_TRUE(
-      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
-  ASSERT_TRUE( async_success ) << async_message;
+      waitUntil( [&] { return !orchestrator_->isControllerActive( kController ); }, 5000ms ) );
 
-  const auto after_resp = this->list_controllers();
-  ASSERT_NE( after_resp, nullptr );
-  const auto after_states = states_from_list( *after_resp );
-
-  // Verify nothing changed - controller still active, all other states unchanged
-  EXPECT_EQ( after_states.at( "flipper_velocity_controller" ), "active" );
-  for ( const auto &pair : before_states ) {
-    EXPECT_EQ( after_states.at( pair.first ), pair.second );
-  }
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSeparateControllers )
-{
-  if ( TypeParam::ExecutorType::name() == std::string( "SingleThreaded" ) ) {
-    GTEST_SKIP() << "Skipping sync test for single threaded executor to avoid deadlock.";
-  }
-
-  // 1. Deactivate gripper
-  const std::string gripper_ctrl = "gripper_trajectory_controller";
-  ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &gripper_ctrl]() {
-    return this->orchestrator_->deactivateControllers( { gripper_ctrl }, 10 );
-  } ) );
-  ASSERT_TRUE( this->wait_for_list_states( { { gripper_ctrl, "inactive" } }, 20s ) );
-
-  // 2. Activate Both (THE FIX: Use spin_while_executing)
-  const std::vector<std::string> requested = { "flipper_trajectory_controller",
-                                               "gripper_trajectory_controller" };
-  this->activity_sub_->reset();
-
-  bool switch_success = false;
-  auto to_activate = requested;
-
-  // WRAP THIS CALL:
-  switch_success = spin_while_executing( *this->executor_, [this, &to_activate]() {
-    return this->orchestrator_->smartSwitchController( to_activate, 10 );
-  } );
-
-  ASSERT_TRUE( switch_success );
-
-  /*ASSERT_TRUE( this->wait_for_activity(
-      { { "flipper_trajectory_controller", "active" }, { "gripper_trajectory_controller", "active" }
-     }, 20s ) );*/
-
-  // Verification
-  const auto after_resp = this->list_controllers();
-  ASSERT_NE( after_resp, nullptr );
-  const auto after_states = states_from_list( *after_resp );
-  EXPECT_EQ( after_states.at( "flipper_trajectory_controller" ), "active" );
-  EXPECT_EQ( after_states.at( "gripper_trajectory_controller" ), "active" );
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchSeparateControllersAsync )
-{
-  // Test activating two separate controllers that don't interfere with each other (async version)
-  // flipper_trajectory_controller and gripper_trajectory_controller use different hardware interfaces
-
-  // First, deactivate gripper to set up initial state
-  const std::string gripper = "gripper_trajectory_controller";
-  ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &gripper]() {
-    return this->orchestrator_->deactivateControllers( { gripper }, 10 );
-  } ) );
-  ASSERT_TRUE( this->wait_for_list_states( { { gripper, "inactive" } }, 20s ) );
-
-  // Now try to activate both controllers
-  const std::vector<std::string> requested = { "flipper_trajectory_controller",
-                                               "gripper_trajectory_controller" };
-
-  const auto before_resp = this->list_controllers();
-  ASSERT_NE( before_resp, nullptr );
-  const auto before_states = states_from_list( *before_resp );
-
-  this->activity_sub_->reset();
-  std::atomic<bool> callback_done{ false };
-  bool async_success = false;
-  std::string async_message;
-
-  this->orchestrator_->smartSwitchControllerAsync(
-      requested,
-      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
-        async_success = success;
-        async_message = message;
-        callback_done = true;
-      } );
-
-  ASSERT_TRUE( this->wait_for_activity( { { "flipper_trajectory_controller", "active" },
-                                          { "gripper_trajectory_controller", "active" } },
-                                        20s ) );
-  ASSERT_TRUE(
-      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
-  ASSERT_TRUE( async_success );
-
-  const auto after_resp = this->list_controllers();
-  ASSERT_NE( after_resp, nullptr );
-  const auto after_states = states_from_list( *after_resp );
-
-  // Both controllers should be active
-  EXPECT_EQ( after_states.at( "flipper_trajectory_controller" ), "active" );
-  EXPECT_EQ( after_states.at( "gripper_trajectory_controller" ), "active" );
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchImpossibleCombination )
-{
-  if ( TypeParam::ExecutorType::name() == std::string( "SingleThreaded" ) ) {
-    GTEST_SKIP() << "Skipping sync test for single threaded executor to avoid deadlock.";
-  }
-
-  const std::vector<std::string> requested = { "flipper_trajectory_controller",
-                                               "vel_to_pos_controller" };
-
-  // Get initial state
-  const auto before_resp = this->list_controllers();
-  ASSERT_NE( before_resp, nullptr );
-  const auto before_states = states_from_list( *before_resp );
-
-  this->activity_sub_->reset();
-  auto to_activate = requested;
-
-  // WRAP THIS CALL:
-  bool switch_success = spin_while_executing( *this->executor_, [this, &to_activate]() {
-    return this->orchestrator_->smartSwitchController( to_activate, 10 );
-  } );
-
-  // This combination should fail in analysis
-  ASSERT_FALSE( switch_success );
-
-  // Verify state is unchanged
-  const auto after_resp = this->list_controllers();
-  ASSERT_NE( after_resp, nullptr );
-  const auto after_states = states_from_list( *after_resp );
-  for ( const auto &pair : before_states ) {
-    EXPECT_EQ( after_states.at( pair.first ), pair.second );
-  }
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, SmartSwitchImpossibleCombinationAsync )
-{
-  // Test activating an impossible combination (async version): flipper_trajectory_controller and
-  // vel_to_pos_controller These controllers are in the same chain but flipper_trajectory depends on
-  // safety controllers, so activating both the top of the chain and a middle controller should fail
-
-  const std::vector<std::string> requested = { "flipper_trajectory_controller",
-                                               "vel_to_pos_controller" };
-
-  const auto before_resp = this->list_controllers();
-  ASSERT_NE( before_resp, nullptr );
-  const auto before_states = states_from_list( *before_resp );
-
-  this->activity_sub_->reset();
-  std::atomic<bool> callback_done{ false };
-  bool async_success = false;
-  std::string async_message;
-
-  this->orchestrator_->smartSwitchControllerAsync(
-      requested,
-      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
-        async_success = success;
-        async_message = message;
-        callback_done = true;
-      } );
-
-  ASSERT_TRUE(
-      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
-
-  // This combination should fail in analysis
-  ASSERT_FALSE( async_success );
-
-  const auto after_resp = this->list_controllers();
-  ASSERT_NE( after_resp, nullptr );
-  const auto after_states = states_from_list( *after_resp );
-
-  // Verify nothing changed - all states should be identical to before
-  for ( const auto &pair : before_states ) {
-    EXPECT_EQ( after_states.at( pair.first ), pair.second );
-  }
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, RefreshControllerStates )
-{
-  ASSERT_TRUE( spin_while_executing(
-      *this->executor_, [this]() { return this->orchestrator_->refreshControllerStates( 10 ); } ) );
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, ActivateDeactivateControllers )
-{
-  const std::string controller = "gripper_trajectory_controller";
-
-  const auto before_resp = this->list_controllers();
-  ASSERT_NE( before_resp, nullptr );
-  const auto before_states = states_from_list( *before_resp );
-  ASSERT_EQ( before_states.at( controller ), "active" );
-
-  ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &controller]() {
-    return this->orchestrator_->deactivateControllers( { controller }, 10 );
-  } ) );
-  ASSERT_TRUE( this->wait_for_list_states( { { controller, "inactive" } }, 20s ) );
-
-  const auto after_deactivate = this->list_controllers();
-  ASSERT_NE( after_deactivate, nullptr );
-  const auto after_states = states_from_list( *after_deactivate );
-  EXPECT_EQ( after_states.at( controller ), "inactive" );
-
-  ASSERT_TRUE( spin_while_executing( *this->executor_, [this, &controller]() {
-    return this->orchestrator_->activateControllers( { controller }, 10 );
-  } ) );
-  ASSERT_TRUE( this->wait_for_list_states( { { controller, "active" } }, 20s ) );
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, GetActiveControllerOfHardwareInterface )
-{
-  bool is_multiple_chained_config =
-      ( std::string( TypeParam::ConfigType::name() ) == "MultipleChained" );
-  const auto flipper_controllers = spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->getActiveControllerOfHardwareInterface( "athena_flipper_interface",
-                                                                        10 );
-  } );
-  // at startup, there should be a controller chain of two controllers active on the flipper interface
-  EXPECT_NE( std::find( flipper_controllers.begin(), flipper_controllers.end(),
-                        "flipper_velocity_controller" ),
-             flipper_controllers.end() );
-  EXPECT_NE(
-      std::find( flipper_controllers.begin(), flipper_controllers.end(), "vel_to_pos_controller" ),
-      flipper_controllers.end() );
-  // make sure there are no false positives
-  int flp_ctrls = is_multiple_chained_config ? 3 : 2;
-  EXPECT_EQ( flipper_controllers.size(), flp_ctrls );
-
-  const auto arm_controllers = spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->getActiveControllerOfHardwareInterface( "athena_arm_interface", 10 );
-  } );
-  // at startup, there should be two controllers active on the arm interface (not a chain)
-  EXPECT_NE( std::find( arm_controllers.begin(), arm_controllers.end(), "arm_trajectory_controller" ),
-             arm_controllers.end() );
-  EXPECT_NE(
-      std::find( arm_controllers.begin(), arm_controllers.end(), "gripper_trajectory_controller" ),
-      arm_controllers.end() );
-  if ( is_multiple_chained_config ) {
-    EXPECT_NE( std::find( arm_controllers.begin(), arm_controllers.end(),
-                          "arm_safety_position_controller" ),
-               arm_controllers.end() );
-  }
-  int arm_ctrls = is_multiple_chained_config ? 3 : 2;
-  EXPECT_EQ( arm_controllers.size(), arm_ctrls );
-
-  const auto unknown_controllers = spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->getActiveControllerOfHardwareInterface( "unknown_interface", 10 );
-  } );
-  EXPECT_TRUE( unknown_controllers.empty() );
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, UnloadControllersOfJoint )
-{
-  bool is_multiple_chained_config =
-      ( std::string( TypeParam::ConfigType::name() ) == "MultipleChained" );
-  // case: unknown joint → no-op
-  ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->unloadControllersOfJoint( "unknown_joint", 10 );
-  } ) );
-  // case: joint with active controller → deactivate controller
-  ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->unloadControllersOfJoint( "gripper_servo_joint", 10 );
-  } ) );
-  ASSERT_TRUE(
-      this->wait_for_list_states( { { "gripper_trajectory_controller", "inactive" } }, 20s ) );
-  // case: controller chain → deactivate all controllers in chain
-  // get number of currently active controllers in general
-  const int active_before = this->get_number_of_active_controllers();
-  ASSERT_GT( active_before, 0 );
-  ASSERT_TRUE( spin_while_executing( *this->executor_, [this]() {
-    return this->orchestrator_->unloadControllersOfJoint( "flipper_fl_joint", 10 );
-  } ) );
-  ASSERT_TRUE( this->wait_for_list_states(
-      { { "flipper_velocity_controller", "inactive" }, { "vel_to_pos_controller", "inactive" } },
-      20s ) );
-  const int active_after = this->get_number_of_active_controllers();
-  int flipper_ctrls = is_multiple_chained_config ? 3 : 2;
-  EXPECT_EQ( active_before - active_after,
-             flipper_ctrls ); // two controllers should have been deactivated, not more
-}
-
-TYPED_TEST( ControllerOrchestratorTypedFixture, RefreshControllerStatesAsync )
-{
-  std::atomic<bool> callback_done{ false };
-  bool async_success = false;
-  std::string async_message;
-
-  this->orchestrator_->refreshControllerStatesAsync(
-      [&callback_done, &async_success, &async_message]( bool success, const std::string &message ) {
-        async_success = success;
-        async_message = message;
-        callback_done = true;
-      } );
-
-  ASSERT_TRUE(
-      this->executor_->spin_until( [&callback_done]() { return callback_done.load(); }, 20s ) );
-  ASSERT_TRUE( async_success ) << async_message;
+  ASSERT_TRUE( orchestrator_->smartSwitchController( { kController }, 3 ) );
+  EXPECT_EQ( requests().back().strictness, SwitchController::Request::STRICT );
 }

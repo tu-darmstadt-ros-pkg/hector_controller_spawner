@@ -18,6 +18,7 @@
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>controller_manager</test_depend>
+  <test_depend>hector_controller_manager</test_depend>
   <test_depend>hector_ros_controllers</test_depend>
   <test_depend>joint_state_broadcaster</test_depend>
   <test_depend>joint_trajectory_controller</test_depend>

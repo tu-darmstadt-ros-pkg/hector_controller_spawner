@@ -1,10 +1,12 @@
 import os
+import signal
 import unittest
 import subprocess
 import time
 from ament_index_python.packages import get_package_share_directory
 import launch
 import launch.actions
+import launch.substitutions
 import launch_ros.actions
 import launch_testing
 import launch_testing.actions
@@ -39,7 +41,7 @@ def generate_test_description():
     )
 
     controller_manager = launch_ros.actions.Node(
-        package="controller_manager",
+        package=launch.substitutions.LaunchConfiguration("cm_package"),
         executable="ros2_control_node",
         output="screen",
         parameters=[controller_config],
@@ -49,6 +51,9 @@ def generate_test_description():
     return (
         launch.LaunchDescription(
             [
+                launch.actions.DeclareLaunchArgument(
+                    "cm_package", default_value="controller_manager"
+                ),
                 robot_state_publisher,
                 controller_manager,
                 launch.actions.TimerAction(
@@ -92,7 +97,7 @@ class TestControllerSpawnerIdempotency(unittest.TestCase):
             "--params-file",
             spawner_config,
             "-p",
-            f"controller_param_files:=[{controller_config}]",
+            f"controller_param_files:=['{controller_config}']",
         ]
 
         # 1. Check initial state (no controllers loaded)
@@ -102,12 +107,12 @@ class TestControllerSpawnerIdempotency(unittest.TestCase):
 
         # 2. Run spawner first time
         self.node.get_logger().info("Running spawner first time...")
-        process1 = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process1 = self._start_spawner(cmd)
 
         # Wait for spawner to complete
-        return_code1 = process1.wait(timeout=30)  # 30 second timeout
-
-        stdout1, stderr1 = process1.communicate()
+        # communicate() drains the pipes, which wait() leaves to fill up and block the spawner
+        stdout1, stderr1 = process1.communicate(timeout=30)
+        return_code1 = process1.returncode
         self.assertEqual(
             return_code1, 0, f"First spawner run failed with return code {return_code1}"
         )
@@ -140,12 +145,11 @@ class TestControllerSpawnerIdempotency(unittest.TestCase):
         time.sleep(3.0)  # Delay between runs
 
         self.node.get_logger().info("Running spawner second time...")
-        process2 = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process2 = self._start_spawner(cmd)
 
         # Wait for second spawner to complete
-        return_code2 = process2.wait(timeout=30)
-
-        stdout2, stderr2 = process2.communicate()
+        stdout2, stderr2 = process2.communicate(timeout=30)
+        return_code2 = process2.returncode
         self.assertEqual(
             return_code2,
             0,
@@ -215,6 +219,29 @@ class TestControllerSpawnerIdempotency(unittest.TestCase):
             self.node.get_logger().info(
                 f"Second spawner stdout: {stdout2.decode()[:200]}..."
             )
+
+    def _start_spawner(self, cmd):
+        # A spawner left running after a failure brings up the hardware of the next test
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.addCleanup(self._stop_spawner, process)
+        return process
+
+    @staticmethod
+    def _stop_spawner(process):
+        if process.poll() is not None:
+            return
+        # The group, since ros2 run starts the spawner as a child of its own
+        os.killpg(process.pid, signal.SIGINT)
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
 
     def _get_controller_list(self):
         """Helper to get current controller list"""

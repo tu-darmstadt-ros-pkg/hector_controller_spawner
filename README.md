@@ -3,7 +3,7 @@
 
 Toolkit containing:
 - **Hector Controller Spawner (Multispawner):** One-shot launcher that loads/activates hardware and controllers with chaining, retries, and optional e-stop gating.
-- **Hector Controller Orchestrator:** C++ helper library that performs dependency-aware, resource-safe controller switching. See [hector_controller_orchestrator/README.md](hector_controller_orchestrator/README.md).
+- **Hector Controller Orchestrator:** C++ client that activates controllers together with their chain and stops what conflicts, on `hector_controller_manager` or stock ros2_control. See [hector_controller_orchestrator/README.md](hector_controller_orchestrator/README.md).
 ---
 ## Hector Controller Spawner – **Multispawner**
 
@@ -36,9 +36,10 @@ ready to go with minimal configuration.
 | `hardware_interfaces`            | `string[]` | -       | Ordered list of hardware interface names to activate.                     |
 | `controllers`                    | `string[]` | -       | Ordered list of controller names to load and manage.                      |
 | `<ctrl>.activate`                | `bool`     | `true`  | Should the controller be activated after loading?                         |
+| `controller_param_files`         | `string[]` | `[]`    | Parameter files of the controllers. Set as `<ctrl>.params_file` on the manager, the only way either manager passes parameters on to a controller. |
 | `retry_delay`                    | `double`   | `5.0`   | Delay (in seconds) between retry attempts.                                |
 | `start_delay`                     | `double`   | `0.0`   | Initial delay (in seconds) before starting the spawner process.           |
-| `srv_call_timeout_ms`             | `int`      | `5000`  | Timeout (in milliseconds) for service calls to the controller manager.    |
+| `service_call_timeout_ms`         | `int`      | `5000`  | Timeout (in milliseconds) for service calls to the controller manager.    |
 | `load_groups_one_by_one`         | `bool`     | `true`  | Load controllers in groups (chained controllers together) or all at once. |
 | `estop_topic`                    | `string`   | `""`    | Topic to wait on (false ⇒ proceed). Leave empty to disable e-stop gating. |
 | `restart_after_estop_deactivation` | `bool`     | `true`  | Restart hardware and controllers after e-stop deactivation                |
@@ -53,16 +54,17 @@ ros2 launch hector_controller_spawner hector_controller_spawner_launch.yml
 ```
 
 * Include **only once** in your launch setup.
+* Works with `controller_manager` and `hector_controller_manager`. Do not run it next to a `hector_controller_manager` that has `estop_topics` or `startup.*` configured, because the manager's own autostart after a release races the spawner.
 * No need for individual `spawner` calls per controller.
 
 
 ---
 # Hector Controller Orchestrator
-C++ utility library that makes controller switching safe and predictable in `ros2_control` systems. It:
-- Resolves chained dependencies automatically (starts dependencies first, stops dependents first).
-- Detects resource conflicts and computes which controllers must deactivate before activating new ones.
-- Provides synchronous and asynchronous APIs; async variants are safe for single-threaded executors.
-- Caches controller state from `controller_manager/activity` to avoid repeated service calls.
-- Exposes helper utilities to query active controllers for a hardware interface or unload all controllers claiming a joint.
+C++ client of the controller manager's `switch_controller` service. You name the controllers you
+want active, and the controllers they chain into are started and whatever conflicts is stopped.
+
+- Works with `hector_controller_manager` and with stock ros2_control. A manager that lists `force_auto` in its `capabilities` parameter gets one FORCE_AUTO request and resolves everything itself. Any other gets one STRICT request that the orchestrator planned from `list_controllers`.
+- Provides synchronous and asynchronous APIs; the async variant is safe for single-threaded executors.
+- Reports controller states from the manager's latest `~/activity` message.
 
 Read the full guide and examples: [hector_controller_orchestrator/README.md](hector_controller_orchestrator/README.md)
